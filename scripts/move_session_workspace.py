@@ -378,11 +378,13 @@ async def _assert_integrity(session: AsyncSession, target_ws: str) -> None:
     or any queue row references a missing session."""
     for model in _CHILD_MODELS:
         tname = getattr(model, "__tablename__", None) or model.__table__.name
+        # A NULL session_name is legitimately session-less (peer-global documents),
+        # not an orphan — only flag rows whose non-null session_name fails to resolve.
         orphan = await session.scalar(
             text(
                 f"SELECT 1 FROM {tname} c "
                 f"LEFT JOIN sessions s ON s.name=c.session_name AND s.workspace_name=c.workspace_name "
-                f"WHERE s.name IS NULL LIMIT 1"
+                f"WHERE c.session_name IS NOT NULL AND s.name IS NULL LIMIT 1"
             )
         )
         if orphan:

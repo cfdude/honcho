@@ -596,3 +596,29 @@ def test_cli_runs_as_script_without_name_error():
     combined = result.stdout + result.stderr
     assert "NameError" not in combined, combined
     assert "same workspace" in combined, combined
+
+
+@pytest.mark.asyncio
+async def test_assert_integrity_ignores_peer_global_documents(db_session: AsyncSession):
+    """Regression: peer-global documents (session_name IS NULL) are legitimately
+    session-less and must NOT be flagged as orphans by _assert_integrity."""
+    from scripts.move_session_workspace import _assert_integrity
+
+    await _mk_workspace(db_session, "wsgi")
+    db_session.add(models.Peer(name="p", workspace_name="wsgi"))
+    await db_session.flush()  # peer must exist before the collection FK
+    db_session.add(models.Collection(observer="p", observed="p", workspace_name="wsgi"))
+    await db_session.flush()
+    db_session.add(
+        models.Document(
+            workspace_name="wsgi",
+            session_name=None,  # peer-global
+            observer="p",
+            observed="p",
+            content="global fact",
+            source_ids=[],
+        )
+    )
+    await db_session.flush()
+    # Must NOT raise (would raise "orphaned rows in documents" before the fix).
+    await _assert_integrity(db_session, "wsgi")
