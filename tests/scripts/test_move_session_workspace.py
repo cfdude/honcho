@@ -416,3 +416,43 @@ async def test_cross_boundary_premises_flags_only_outside_move_set(
     flagged = await cross_boundary_premises(db_session, "personal", {"a", "b"})
     assert prem_out.id in flagged  # "other" is outside the move set → flagged
     assert prem_co.id not in flagged  # "b" is co-moved → not flagged
+
+
+@pytest.mark.asyncio
+async def test_relocate_create_new_repoints_and_deletes_old(db_session: AsyncSession):
+    await _mk_workspace(db_session, "personal")
+    await _mk_workspace(db_session, "highway")
+    db_session.add(models.Peer(name="robsherman", workspace_name="highway"))
+    db_session.add(models.Peer(name="robsherman", workspace_name="personal"))
+    db_session.add(models.Session(name="s1", workspace_name="personal"))
+    await db_session.flush()
+    old = await db_session.scalar(
+        select(models.Session).where(
+            models.Session.workspace_name == "personal", models.Session.name == "s1"
+        )
+    )
+    old_id = old.id
+    db_session.add(
+        models.Message(
+            session_name="s1",
+            workspace_name="personal",
+            peer_name="robsherman",
+            content="hi",
+            seq_in_session=0,
+        )
+    )
+    await db_session.flush()
+
+    from scripts.move_session_workspace import relocate_create_new
+
+    await relocate_create_new(db_session, "personal", "highway", "s1", "s1")
+    await db_session.flush()
+
+    moved = await db_session.scalar(
+        select(models.Session).where(
+            models.Session.workspace_name == "highway", models.Session.name == "s1"
+        )
+    )
+    assert moved is not None and moved.id != old_id  # id churns on fallback
+    assert await _count(db_session, models.Message, "highway", "s1") == 1
+    assert await _session_row_helper(db_session, "personal", "s1") is None

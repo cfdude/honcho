@@ -270,6 +270,41 @@ async def relocate_in_place(
         )
 
 
+async def relocate_create_new(
+    session: AsyncSession,
+    source_ws: str,
+    target_ws: str,
+    source_name: str,
+    target_name: str,
+) -> None:
+    """Move a session to a new ``(name, workspace_name)`` by creating a fresh
+    session row (full-column copy, new id), repointing children to the new row,
+    then deleting the old session row.
+
+    This is the no-privilege fallback for deployments where deferrable
+    constraints cannot be used. Queue rows MUST be cleared before calling this
+    (``apply_moves`` does so automatically).
+    """
+    old = await _session_row(session, source_ws, source_name)
+    if old is None:
+        return
+    # 1. new target session row (full-column copy, fresh id)
+    session.add(
+        _copy_row(old, models.Session, workspace_name=target_ws, name=target_name)
+    )
+    await session.flush()
+    # 2. repoint children to the new (name, workspace) — both rows exist, FK resolves
+    for model in _CHILD_MODELS:
+        await session.execute(
+            update(model)
+            .where(model.workspace_name == source_ws, model.session_name == source_name)
+            .values(workspace_name=target_ws, session_name=target_name)
+        )
+    # 3. delete the now-unreferenced old session row
+    #    (queue rows were already cleared by apply_moves before this call)
+    await session.execute(delete(models.Session).where(models.Session.id == old.id))
+
+
 async def clear_session_queue(
     session: AsyncSession, ws: str, name: str, force: bool
 ) -> int:
@@ -368,18 +403,25 @@ async def apply_moves(
     target_ws: str,
     plans: list[SessionPlan],
     force_clear_queue: bool,
+    strategy: str = "in_place",
 ) -> None:
     """Apply the given plans: for each plan ensure dependencies, clear queue,
-    relocate in place, then flush and assert integrity.
+    relocate, then flush and assert integrity.
+
+    ``strategy`` selects the relocate implementation:
+    - ``"in_place"`` (default): id-preserving, requires deferrable constraints.
+    - ``"create_new"``: creates a fresh session row; works without deferrable
+      constraints but the session id changes.
 
     The caller controls the outer transaction (commit/rollback).
     """
+    relocate = relocate_in_place if strategy == "in_place" else relocate_create_new
     for plan in plans:
         await ensure_dependencies(session, source_ws, target_ws, plan.source_name)
         await clear_session_queue(
             session, source_ws, plan.source_name, force=force_clear_queue
         )
-        await relocate_in_place(
+        await relocate(
             session, source_ws, target_ws, plan.source_name, plan.target_name
         )
     await session.flush()
