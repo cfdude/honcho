@@ -324,6 +324,36 @@ async def test_clear_queue_force_deletes_pending(db_session: AsyncSession):
 
 
 @pytest.mark.asyncio
+async def test_apply_then_integrity_clean(db_session: AsyncSession):
+    await _mk_workspace(db_session, "personal")
+    await _mk_workspace(db_session, "highway")
+    await _mk_session_with_messages(db_session, "personal", "s1", "robsherman", 2)
+
+    from scripts.move_session_workspace import apply_moves, plan_moves
+
+    plans = await plan_moves(db_session, "personal", "highway", ["s1"])
+    await apply_moves(db_session, "personal", "highway", plans, force_clear_queue=True)
+    await db_session.flush()
+
+    assert await _count(db_session, models.Message, "highway", "s1") == 2
+    assert await _count(db_session, models.Message, "personal", "s1") == 0
+
+
+@pytest.mark.asyncio
+async def test_dry_run_writes_nothing(db_session: AsyncSession):
+    await _mk_workspace(db_session, "personal")
+    await _mk_workspace(db_session, "highway")
+    await _mk_session_with_messages(db_session, "personal", "s1", "robsherman", 2)
+
+    from scripts.move_session_workspace import plan_moves
+
+    before = await _count(db_session, models.Message, "personal", "s1")
+    await plan_moves(db_session, "personal", "highway", ["s1"])  # plan only, no apply
+    after = await _count(db_session, models.Message, "personal", "s1")
+    assert before == after == 2  # plan_moves is read-only
+
+
+@pytest.mark.asyncio
 async def test_cross_boundary_premises_flags_only_outside_move_set(
     db_session: AsyncSession,
 ):

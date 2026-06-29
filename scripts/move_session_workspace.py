@@ -336,6 +336,54 @@ async def cross_boundary_premises(
     return flagged
 
 
+async def _assert_integrity(session: AsyncSession, target_ws: str) -> None:
+    """Raise MoveError if any child row has an unparented (session_name, workspace_name)
+    or any queue row references a missing session."""
+    for model in _CHILD_MODELS:
+        tname = getattr(model, "__tablename__", None) or model.__table__.name
+        orphan = await session.scalar(
+            text(
+                f"SELECT 1 FROM {tname} c "
+                f"LEFT JOIN sessions s ON s.name=c.session_name AND s.workspace_name=c.workspace_name "
+                f"WHERE s.name IS NULL LIMIT 1"
+            )
+        )
+        if orphan:
+            raise MoveError(f"integrity: orphaned rows in {tname}")
+    dangling = await session.scalar(
+        text(
+            "SELECT 1 FROM queue q LEFT JOIN sessions s ON s.id=q.session_id "
+            "WHERE q.session_id IS NOT NULL AND s.id IS NULL LIMIT 1"
+        )
+    )
+    if dangling:
+        raise MoveError("integrity: queue rows reference a missing session")
+
+
+async def apply_moves(
+    session: AsyncSession,
+    source_ws: str,
+    target_ws: str,
+    plans: list[SessionPlan],
+    force_clear_queue: bool,
+) -> None:
+    """Apply the given plans: for each plan ensure dependencies, clear queue,
+    relocate in place, then flush and assert integrity.
+
+    The caller controls the outer transaction (commit/rollback).
+    """
+    for plan in plans:
+        await ensure_dependencies(session, source_ws, target_ws, plan.source_name)
+        await clear_session_queue(
+            session, source_ws, plan.source_name, force=force_clear_queue
+        )
+        await relocate_in_place(
+            session, source_ws, target_ws, plan.source_name, plan.target_name
+        )
+    await session.flush()
+    await _assert_integrity(session, target_ws)
+
+
 async def plan_moves(
     session: AsyncSession,
     source_ws: str,
