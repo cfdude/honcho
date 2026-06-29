@@ -6,7 +6,7 @@
       "id": "cross-workspace-session-move",
       "title": "Lossless cross-workspace session move (workspace-bleed fix)",
       "priority": "P1",
-      "status": "active",
+      "status": "archived",
       "role": "epic",
       "lane": "superpowers",
       "links": [],
