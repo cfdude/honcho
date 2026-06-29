@@ -1,0 +1,18 @@
+{
+  "version": 1,
+  "active": null,
+  "epics": [
+    {
+      "id": "cross-workspace-session-move",
+      "title": "Lossless cross-workspace session move (workspace-bleed fix)",
+      "priority": "P1",
+      "status": "active",
+      "role": "epic",
+      "lane": "superpowers",
+      "links": [],
+      "reconcileNeeded": false
+    }
+  ],
+  "detourStack": [],
+  "pmVersion": "0.6.1"
+}
