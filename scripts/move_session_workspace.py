@@ -82,6 +82,124 @@ async def _resolve_target_name(
     return candidate, True, False
 
 
+def _copy_row(src_obj, model, **overrides):
+    """Full-column copy of an ORM row into a new instance, with overrides."""
+    data = {c.name: getattr(src_obj, c.name) for c in model.__table__.columns}
+    data.pop("id", None)  # let the nanoid default generate a fresh PK
+    data.update(overrides)
+    return model(**data)
+
+
+async def _required_peers(session: AsyncSession, ws: str, name: str) -> set[str]:
+    peers: set[str] = set()
+    peers.update(
+        await session.scalars(
+            select(models.Message.peer_name.distinct()).where(
+                models.Message.workspace_name == ws, models.Message.session_name == name
+            )
+        )
+    )
+    peers.update(
+        await session.scalars(
+            select(models.MessageEmbedding.peer_name.distinct()).where(
+                models.MessageEmbedding.workspace_name == ws,
+                models.MessageEmbedding.session_name == name,
+            )
+        )
+    )
+    peers.update(
+        await session.scalars(
+            select(models.SessionPeer.peer_name.distinct()).where(
+                models.SessionPeer.workspace_name == ws,
+                models.SessionPeer.session_name == name,
+            )
+        )
+    )
+    for col in (models.Document.observer, models.Document.observed):
+        peers.update(
+            await session.scalars(
+                select(col.distinct()).where(
+                    models.Document.workspace_name == ws,
+                    models.Document.session_name == name,
+                )
+            )
+        )
+    peers.discard(None)
+    return peers
+
+
+async def _required_collections(
+    session: AsyncSession, ws: str, name: str
+) -> set[tuple[str, str]]:
+    rows = await session.execute(
+        select(models.Document.observer, models.Document.observed)
+        .where(
+            models.Document.workspace_name == ws,
+            models.Document.session_name == name,
+        )
+        .distinct()
+    )
+    return {(o, d) for o, d in rows.all()}
+
+
+async def ensure_dependencies(
+    session: AsyncSession,
+    source_ws: str,
+    target_ws: str,
+    name: str,
+) -> tuple[list[str], list[tuple[str, str]]]:
+    """Create missing target peers/collections as full-column copies from source.
+
+    Existing rows in the target workspace are left untouched. Returns lists of
+    peer names and (observer, observed) pairs that were created.
+    """
+    created_peers: list[str] = []
+    for pname in sorted(await _required_peers(session, source_ws, name)):
+        exists = await session.scalar(
+            select(models.Peer).where(
+                models.Peer.workspace_name == target_ws,
+                models.Peer.name == pname,
+            )
+        )
+        if exists is None:
+            src = await session.scalar(
+                select(models.Peer).where(
+                    models.Peer.workspace_name == source_ws,
+                    models.Peer.name == pname,
+                )
+            )
+            if src is not None:
+                session.add(_copy_row(src, models.Peer, workspace_name=target_ws))
+                created_peers.append(pname)
+
+    # Flush peers before collections: Collection has FK to peers in same workspace.
+    if created_peers:
+        await session.flush()
+
+    created_cols: list[tuple[str, str]] = []
+    for obs, observed in sorted(await _required_collections(session, source_ws, name)):
+        exists = await session.scalar(
+            select(models.Collection).where(
+                models.Collection.workspace_name == target_ws,
+                models.Collection.observer == obs,
+                models.Collection.observed == observed,
+            )
+        )
+        if exists is None:
+            src = await session.scalar(
+                select(models.Collection).where(
+                    models.Collection.workspace_name == source_ws,
+                    models.Collection.observer == obs,
+                    models.Collection.observed == observed,
+                )
+            )
+            if src is not None:
+                session.add(_copy_row(src, models.Collection, workspace_name=target_ws))
+                created_cols.append((obs, observed))
+
+    return created_peers, created_cols
+
+
 async def plan_moves(
     session: AsyncSession,
     source_ws: str,

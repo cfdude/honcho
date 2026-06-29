@@ -1,4 +1,5 @@
 import pytest
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from scripts.move_session_workspace import MoveError, plan_moves
@@ -84,3 +85,100 @@ async def test_plan_skip_mode_leaves_collision(db_session: AsyncSession):
         db_session, "personal", "highway", ["maca"], on_collision="skip"
     )
     assert plans == []  # skipped, nothing to do
+
+
+@pytest.mark.asyncio
+async def test_ensure_dependencies_copies_missing_peer_fullcolumn(
+    db_session: AsyncSession,
+):
+    await _mk_workspace(db_session, "personal")
+    await _mk_workspace(db_session, "highway")
+    # peer with metadata in personal; session uses it
+    db_session.add(
+        models.Peer(
+            name="robsherman",
+            workspace_name="personal",
+            internal_metadata={"card": "x"},
+        )
+    )
+    db_session.add(models.Session(name="s1", workspace_name="personal"))
+    await db_session.flush()
+    db_session.add(
+        models.Message(
+            session_name="s1",
+            workspace_name="personal",
+            peer_name="robsherman",
+            content="hi",
+            seq_in_session=0,
+        )
+    )
+    await db_session.flush()
+
+    from scripts.move_session_workspace import ensure_dependencies
+
+    created_peers, _ = await ensure_dependencies(
+        db_session, "personal", "highway", "s1"
+    )
+    await db_session.flush()
+
+    assert created_peers == ["robsherman"]
+    moved = await db_session.scalar(
+        select(models.Peer).where(
+            models.Peer.workspace_name == "highway",
+            models.Peer.name == "robsherman",
+        )
+    )
+    assert moved is not None
+    assert moved.internal_metadata == {
+        "card": "x"
+    }  # full-column copy preserved peer card
+
+
+@pytest.mark.asyncio
+async def test_ensure_dependencies_leaves_existing_peer_untouched(
+    db_session: AsyncSession,
+):
+    await _mk_workspace(db_session, "personal")
+    await _mk_workspace(db_session, "highway")
+    db_session.add(
+        models.Peer(
+            name="robsherman",
+            workspace_name="personal",
+            internal_metadata={"card": "SOURCE"},
+        )
+    )
+    db_session.add(
+        models.Peer(
+            name="robsherman",
+            workspace_name="highway",
+            internal_metadata={"card": "TARGET"},
+        )
+    )
+    db_session.add(models.Session(name="s1", workspace_name="personal"))
+    await db_session.flush()
+    db_session.add(
+        models.Message(
+            session_name="s1",
+            workspace_name="personal",
+            peer_name="robsherman",
+            content="hi",
+            seq_in_session=0,
+        )
+    )
+    await db_session.flush()
+
+    from scripts.move_session_workspace import ensure_dependencies
+
+    created_peers, _ = await ensure_dependencies(
+        db_session, "personal", "highway", "s1"
+    )
+    await db_session.flush()
+
+    assert created_peers == []  # already present, not created
+    existing = await db_session.scalar(
+        select(models.Peer).where(
+            models.Peer.workspace_name == "highway",
+            models.Peer.name == "robsherman",
+        )
+    )
+    assert existing.internal_metadata == {"card": "TARGET"}  # NOT clobbered
