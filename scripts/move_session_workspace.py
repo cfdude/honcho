@@ -300,6 +300,42 @@ async def clear_session_queue(
     return result.rowcount or 0
 
 
+async def cross_boundary_premises(
+    session: AsyncSession, ws: str, moved_names: set[str]
+) -> list[str]:
+    """Return premise doc ids cited by docs in moved sessions that originate
+    outside the move set (peer-global or in a non-moved session).
+
+    Co-moved premises (``session_name in moved_names``) are NOT flagged.
+    This is a read-only report.
+    """
+    # Collect all premise ids cited by docs in the moved sessions
+    rows = await session.scalars(
+        select(models.Document.source_ids).where(
+            models.Document.workspace_name == ws,
+            models.Document.session_name.in_(moved_names),
+        )
+    )
+    premise_ids: set[str] = set()
+    for sid_list in rows:
+        if sid_list:
+            premise_ids.update(sid_list)
+    if not premise_ids:
+        return []
+    # Find premises that are peer-global or in a non-moved session
+    flagged: list[str] = []
+    prem_rows = await session.execute(
+        select(models.Document.id, models.Document.session_name).where(
+            models.Document.workspace_name == ws,
+            models.Document.id.in_(premise_ids),
+        )
+    )
+    for doc_id, sess_name in prem_rows.all():
+        if sess_name is None or sess_name not in moved_names:
+            flagged.append(doc_id)
+    return flagged
+
+
 async def plan_moves(
     session: AsyncSession,
     source_ws: str,

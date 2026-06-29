@@ -321,3 +321,56 @@ async def test_clear_queue_force_deletes_pending(db_session: AsyncSession):
     deleted = await clear_session_queue(db_session, "personal", "s1", force=True)
     await db_session.flush()
     assert deleted == 1
+
+
+@pytest.mark.asyncio
+async def test_cross_boundary_premises_flags_only_outside_move_set(
+    db_session: AsyncSession,
+):
+    await _mk_workspace(db_session, "personal")
+    db_session.add(models.Peer(name="p", workspace_name="personal"))
+    for s in ("a", "b", "other"):
+        db_session.add(models.Session(name=s, workspace_name="personal"))
+    await db_session.flush()
+    # Collection required by Document FK (observer, observed, workspace_name)
+    db_session.add(
+        models.Collection(observer="p", observed="p", workspace_name="personal")
+    )
+    await db_session.flush()
+    # premise docs
+    prem_co = models.Document(
+        workspace_name="personal",
+        session_name="b",
+        observer="p",
+        observed="p",
+        content="co",
+        source_ids=[],
+    )
+    prem_out = models.Document(
+        workspace_name="personal",
+        session_name="other",
+        observer="p",
+        observed="p",
+        content="out",
+        source_ids=[],
+    )
+    db_session.add_all([prem_co, prem_out])
+    await db_session.flush()
+    # a conclusion in session "a" citing both premises
+    db_session.add(
+        models.Document(
+            workspace_name="personal",
+            session_name="a",
+            observer="p",
+            observed="p",
+            content="concl",
+            source_ids=[prem_co.id, prem_out.id],
+        )
+    )
+    await db_session.flush()
+
+    from scripts.move_session_workspace import cross_boundary_premises
+
+    flagged = await cross_boundary_premises(db_session, "personal", {"a", "b"})
+    assert prem_out.id in flagged  # "other" is outside the move set → flagged
+    assert prem_co.id not in flagged  # "b" is co-moved → not flagged
