@@ -234,3 +234,90 @@ async def test_relocate_preserves_id_and_moves_children(db_session: AsyncSession
     assert await _count(db_session, models.Message, "personal", "s1") == 0
     # no orphaned source session row
     assert await _session_row_helper(db_session, "personal", "s1") is None
+
+
+@pytest.mark.asyncio
+async def test_clear_queue_deletes_rows(db_session: AsyncSession):
+    await _mk_workspace(db_session, "personal")
+    db_session.add(models.Session(name="s1", workspace_name="personal"))
+    await db_session.flush()
+    # seed a processed queue row for the session
+    sess = await db_session.scalar(
+        select(models.Session).where(
+            models.Session.workspace_name == "personal", models.Session.name == "s1"
+        )
+    )
+    db_session.add(
+        models.QueueItem(
+            session_id=sess.id,
+            workspace_name="personal",
+            work_unit_key="test-key-1",
+            task_type="representation",
+            payload={},
+            processed=True,
+        )
+    )
+    await db_session.flush()
+
+    from scripts.move_session_workspace import clear_session_queue
+
+    deleted = await clear_session_queue(db_session, "personal", "s1", force=False)
+    await db_session.flush()
+    assert deleted == 1
+
+
+@pytest.mark.asyncio
+async def test_clear_queue_raises_on_pending_without_force(db_session: AsyncSession):
+    await _mk_workspace(db_session, "personal")
+    db_session.add(models.Session(name="s1", workspace_name="personal"))
+    await db_session.flush()
+    sess = await db_session.scalar(
+        select(models.Session).where(
+            models.Session.workspace_name == "personal", models.Session.name == "s1"
+        )
+    )
+    db_session.add(
+        models.QueueItem(
+            session_id=sess.id,
+            workspace_name="personal",
+            work_unit_key="test-key-2",
+            task_type="representation",
+            payload={},
+            processed=False,
+        )
+    )
+    await db_session.flush()
+
+    from scripts.move_session_workspace import clear_session_queue
+
+    with pytest.raises(MoveError, match="pending queue items"):
+        await clear_session_queue(db_session, "personal", "s1", force=False)
+
+
+@pytest.mark.asyncio
+async def test_clear_queue_force_deletes_pending(db_session: AsyncSession):
+    await _mk_workspace(db_session, "personal")
+    db_session.add(models.Session(name="s1", workspace_name="personal"))
+    await db_session.flush()
+    sess = await db_session.scalar(
+        select(models.Session).where(
+            models.Session.workspace_name == "personal", models.Session.name == "s1"
+        )
+    )
+    db_session.add(
+        models.QueueItem(
+            session_id=sess.id,
+            workspace_name="personal",
+            work_unit_key="test-key-3",
+            task_type="representation",
+            payload={},
+            processed=False,
+        )
+    )
+    await db_session.flush()
+
+    from scripts.move_session_workspace import clear_session_queue
+
+    deleted = await clear_session_queue(db_session, "personal", "s1", force=True)
+    await db_session.flush()
+    assert deleted == 1

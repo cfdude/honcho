@@ -10,7 +10,7 @@ from dataclasses import dataclass, field
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from sqlalchemy import func, select, text, update
+from sqlalchemy import delete, func, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src import models
@@ -266,6 +266,38 @@ async def relocate_in_place(
         await session.execute(
             text(f'ALTER TABLE {child} ALTER CONSTRAINT "{conname}" NOT DEFERRABLE')
         )
+
+
+async def clear_session_queue(
+    session: AsyncSession, ws: str, name: str, force: bool
+) -> int:
+    """Delete all queue rows for ``session``/``ws``/``name``.
+
+    If any rows are unprocessed and ``force`` is False, raises ``MoveError``
+    rather than deleting.  Returns the count of rows deleted.  Queue rows are
+    transient work-state whose ``work_unit_key``/``payload`` embed the old
+    workspace identity, so they are never repointed — only cleared.
+    """
+    sess = await _session_row(session, ws, name)
+    if sess is None:
+        return 0
+    pending = await session.scalar(
+        select(func.count())
+        .select_from(models.QueueItem)
+        .where(
+            models.QueueItem.session_id == sess.id,
+            models.QueueItem.processed.is_(False),
+        )
+    )
+    if pending and not force:
+        raise MoveError(
+            f"session '{name}' has {pending} pending queue items; "
+            f"re-run with --force-clear-queue to delete them"
+        )
+    result = await session.execute(
+        delete(models.QueueItem).where(models.QueueItem.session_id == sess.id)
+    )
+    return result.rowcount or 0
 
 
 async def plan_moves(
