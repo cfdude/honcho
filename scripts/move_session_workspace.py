@@ -430,11 +430,14 @@ def _print_plans(plans: list[SessionPlan], apply: bool) -> None:
 
 
 async def main_async(args) -> int:
-    from src.db import SessionLocal
+    # Planning is read-only; apply uses a separate write session so that
+    # session.begin() is the FIRST DB operation on it, making it a true outer
+    # transaction (not a savepoint nested inside an auto-begun T1).
+    from src.db import ReadSessionLocal, SessionLocal
 
-    async with SessionLocal() as session:
+    async with ReadSessionLocal() as r:
         plans = await plan_moves(
-            session,
+            r,
             args.source,
             args.target,
             args.session,
@@ -444,23 +447,24 @@ async def main_async(args) -> int:
         moved = {p.source_name for p in plans}
         for p in plans:
             p.cross_boundary_premises = await cross_boundary_premises(
-                session, args.source, moved
+                r, args.source, moved
             )
-        _print_plans(plans, apply=args.apply)
-        if not args.apply:
-            return 0
-        if not args.no_backup:
-            import datetime
-
-            path = f"/tmp/honcho-backup-{datetime.datetime.utcnow():%Y%m%dT%H%M%SZ}.sql"
-            _pg_dump(path)
-            print(f"backup written: {path}")
-        async with session.begin():
-            await apply_moves(
-                session, args.source, args.target, plans, args.force_clear_queue
-            )
-        print("move applied.")
+    _print_plans(plans, apply=args.apply)
+    if not args.apply:
         return 0
+    if not args.no_backup:
+        import datetime
+
+        path = f"/tmp/honcho-backup-{datetime.datetime.now(datetime.timezone.utc):%Y%m%dT%H%M%SZ}.sql"
+        _pg_dump(path)
+        print(f"backup written: {path}")
+    # session.begin() is the first DB op on a fresh session → true outer txn
+    async with SessionLocal() as session, session.begin():
+        await apply_moves(
+            session, args.source, args.target, plans, args.force_clear_queue
+        )
+    print("move applied.")
+    return 0
 
 
 def main() -> int:
