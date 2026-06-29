@@ -575,3 +575,24 @@ async def test_apply_rename_path_end_to_end(db_session: AsyncSession):
     original_highway = await _session_row_helper(db_session, "highway", "maca")
     assert original_highway is not None
     assert await _count(db_session, models.Message, "highway", "maca") == 5
+
+
+def test_cli_runs_as_script_without_name_error():
+    """Regression: running the module as a script must not NameError because a
+    function (plan_moves) is defined after the __main__ guard. --from==--to hits
+    the same-workspace guard before any DB query, so this needs no database."""
+    import os
+    import subprocess
+    import sys
+
+    repo = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    script = os.path.join(repo, "scripts", "move_session_workspace.py")
+    result = subprocess.run(
+        [sys.executable, script, "--from", "w", "--to", "w", "--session", "s"],
+        capture_output=True,
+        text=True,
+        cwd=repo,
+    )
+    combined = result.stdout + result.stderr
+    assert "NameError" not in combined, combined
+    assert "same workspace" in combined, combined

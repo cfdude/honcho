@@ -513,10 +513,6 @@ def main() -> int:
     return asyncio.run(main_async(build_parser().parse_args()))
 
 
-if __name__ == "__main__":
-    raise SystemExit(main())
-
-
 async def plan_moves(
     session: AsyncSession,
     source_ws: str,
@@ -593,3 +589,7 @@ async def plan_moves(
             )
         )
     return plans
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
