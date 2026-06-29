@@ -456,3 +456,122 @@ async def test_relocate_create_new_repoints_and_deletes_old(db_session: AsyncSes
     assert moved is not None and moved.id != old_id  # id churns on fallback
     assert await _count(db_session, models.Message, "highway", "s1") == 1
     assert await _session_row_helper(db_session, "personal", "s1") is None
+
+
+@pytest.mark.asyncio
+async def test_plan_populates_create_lists_and_queue_count(db_session: AsyncSession):
+    """plan_moves populates peers_to_create and queue_rows on the SessionPlan."""
+    await _mk_workspace(db_session, "personal")
+    await _mk_workspace(db_session, "highway")
+
+    # Create the source peer+session in personal; highway has NO peer yet (absent)
+    db_session.add(models.Peer(name="robsherman", workspace_name="personal"))
+    db_session.add(models.Session(name="s1", workspace_name="personal"))
+    await db_session.flush()
+
+    db_session.add(
+        models.Message(
+            session_name="s1",
+            workspace_name="personal",
+            peer_name="robsherman",
+            content="hi",
+            seq_in_session=0,
+        )
+    )
+    await db_session.flush()
+
+    # Seed a queue row for the source session
+    sess = await db_session.scalar(
+        select(models.Session).where(
+            models.Session.workspace_name == "personal", models.Session.name == "s1"
+        )
+    )
+    db_session.add(
+        models.QueueItem(
+            session_id=sess.id,
+            workspace_name="personal",
+            work_unit_key="plan-test-key",
+            task_type="representation",
+            payload={},
+            processed=True,
+        )
+    )
+    await db_session.flush()
+
+    plans = await plan_moves(db_session, "personal", "highway", ["s1"])
+
+    assert len(plans) == 1
+    plan = plans[0]
+    assert "robsherman" in plan.peers_to_create  # absent in target → needs creation
+    assert plan.queue_rows == 1  # the queue row we seeded
+
+
+@pytest.mark.asyncio
+async def test_apply_rename_path_end_to_end(db_session: AsyncSession):
+    """apply_moves renames the moved session when a same-named session exists in target."""
+    await _mk_workspace(db_session, "personal")
+    await _mk_workspace(db_session, "highway")
+
+    # Both workspaces have the peer
+    db_session.add(models.Peer(name="robsherman", workspace_name="personal"))
+    db_session.add(models.Peer(name="robsherman", workspace_name="highway"))
+
+    # "maca" session in personal (source) with 3 messages
+    db_session.add(models.Session(name="maca", workspace_name="personal"))
+    # Pre-existing "maca" in highway (the collision) with 5 messages
+    db_session.add(models.Session(name="maca", workspace_name="highway"))
+    await db_session.flush()
+
+    for i in range(3):
+        db_session.add(
+            models.Message(
+                session_name="maca",
+                workspace_name="personal",
+                peer_name="robsherman",
+                content=f"personal-m{i}",
+                seq_in_session=i,
+            )
+        )
+    for i in range(5):
+        db_session.add(
+            models.Message(
+                session_name="maca",
+                workspace_name="highway",
+                peer_name="robsherman",
+                content=f"highway-m{i}",
+                seq_in_session=i,
+            )
+        )
+    await db_session.flush()
+
+    from scripts.move_session_workspace import apply_moves
+
+    plans = await plan_moves(db_session, "personal", "highway", ["maca"])
+
+    # The plan should rename due to collision
+    assert len(plans) == 1
+    assert plans[0].renamed is True
+    assert plans[0].target_name == "maca-from-personal"
+
+    await apply_moves(db_session, "personal", "highway", plans, force_clear_queue=True)
+    await db_session.flush()
+
+    # Moved session exists under renamed name in highway
+    renamed_sess = await _session_row_helper(
+        db_session, "highway", "maca-from-personal"
+    )
+    assert renamed_sess is not None
+
+    # Moved messages are now under the renamed session in highway
+    assert (
+        await _count(db_session, models.Message, "highway", "maca-from-personal") == 3
+    )
+
+    # Original personal session is gone
+    assert await _session_row_helper(db_session, "personal", "maca") is None
+    assert await _count(db_session, models.Message, "personal", "maca") == 0
+
+    # Pre-existing highway "maca" session is untouched with its original 5 messages
+    original_highway = await _session_row_helper(db_session, "highway", "maca")
+    assert original_highway is not None
+    assert await _count(db_session, models.Message, "highway", "maca") == 5

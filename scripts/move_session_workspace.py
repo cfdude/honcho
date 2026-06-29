@@ -542,6 +542,41 @@ async def plan_moves(
         )
         if skip:
             continue
+        # Compute dry-run display fields (all SELECT-only)
+        required_peers = await _required_peers(session, source_ws, name)
+        peers_to_create: list[str] = []
+        for pname in sorted(required_peers):
+            exists = await session.scalar(
+                select(models.Peer).where(
+                    models.Peer.workspace_name == target_ws,
+                    models.Peer.name == pname,
+                )
+            )
+            if exists is None:
+                peers_to_create.append(pname)
+
+        required_cols = await _required_collections(session, source_ws, name)
+        collections_to_create: list[tuple[str, str]] = []
+        for obs, observed in sorted(required_cols):
+            exists = await session.scalar(
+                select(models.Collection).where(
+                    models.Collection.workspace_name == target_ws,
+                    models.Collection.observer == obs,
+                    models.Collection.observed == observed,
+                )
+            )
+            if exists is None:
+                collections_to_create.append((obs, observed))
+
+        queue_rows = (
+            await session.scalar(
+                select(func.count())
+                .select_from(models.QueueItem)
+                .where(models.QueueItem.session_id == src.id)
+            )
+            or 0
+        )
+
         plans.append(
             SessionPlan(
                 source_name=name,
@@ -552,6 +587,9 @@ async def plan_moves(
                     session, models.MessageEmbedding, source_ws, name
                 ),
                 documents=await _count(session, models.Document, source_ws, name),
+                peers_to_create=peers_to_create,
+                collections_to_create=collections_to_create,
+                queue_rows=queue_rows,
             )
         )
     return plans
