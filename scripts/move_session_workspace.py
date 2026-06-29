@@ -10,10 +10,17 @@ from dataclasses import dataclass, field
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src import models
+
+_CHILD_MODELS = (
+    models.Message,
+    models.MessageEmbedding,
+    models.Document,
+    models.SessionPeer,
+)
 
 
 class MoveError(Exception):
@@ -198,6 +205,67 @@ async def ensure_dependencies(
                 created_cols.append((obs, observed))
 
     return created_peers, created_cols
+
+
+async def _session_fk_constraints(session: AsyncSession) -> list[tuple[str, str]]:
+    """Return ``(child_table, conname)`` for every FK whose ``confrelid`` is
+    ``sessions`` (the composite child FKs plus ``queue.session_id``)."""
+    rows = await session.execute(
+        text(
+            "SELECT conrelid::regclass::text AS child, conname "
+            "FROM pg_constraint "
+            "WHERE contype='f' AND confrelid='sessions'::regclass"
+        )
+    )
+    return [(r.child, r.conname) for r in rows]
+
+
+async def relocate_in_place(
+    session: AsyncSession,
+    source_ws: str,
+    target_ws: str,
+    source_name: str,
+    target_name: str,
+) -> None:
+    """Move a session row and its children to a new ``(name, workspace_name)``
+    in place, preserving every ``id``/``public_id``.
+
+    Uses transaction-local deferrable constraints so the parent and child
+    composite FKs are checked together at drain time rather than per-statement.
+    """
+    fks = await _session_fk_constraints(session)
+    # 1. make the session FKs deferrable for this transaction
+    for child, conname in fks:
+        await session.execute(
+            text(f'ALTER TABLE {child} ALTER CONSTRAINT "{conname}" DEFERRABLE')
+        )
+    await session.execute(text("SET CONSTRAINTS ALL DEFERRED"))
+    # 2. move the parent row in place (id/created_at/metadata preserved)
+    await session.execute(
+        update(models.Session)
+        .where(
+            models.Session.workspace_name == source_ws,
+            models.Session.name == source_name,
+        )
+        .values(workspace_name=target_ws, name=target_name)
+    )
+    # 3. move children in place (public_id/id preserved -> no CASCADE).
+    #    queue is intentionally excluded from _CHILD_MODELS (handled later).
+    for model in _CHILD_MODELS:
+        await session.execute(
+            update(model)
+            .where(
+                model.workspace_name == source_ws,
+                model.session_name == source_name,
+            )
+            .values(workspace_name=target_ws, session_name=target_name)
+        )
+    # 4. drain deferred checks (now consistent) BEFORE restoring NOT DEFERRABLE
+    await session.execute(text("SET CONSTRAINTS ALL IMMEDIATE"))
+    for child, conname in fks:
+        await session.execute(
+            text(f'ALTER TABLE {child} ALTER CONSTRAINT "{conname}" NOT DEFERRABLE')
+        )
 
 
 async def plan_moves(

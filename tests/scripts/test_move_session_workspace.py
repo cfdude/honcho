@@ -3,6 +3,8 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from scripts.move_session_workspace import MoveError, plan_moves
+from scripts.move_session_workspace import _count
+from scripts.move_session_workspace import _session_row as _session_row_helper
 from src import models
 
 
@@ -182,3 +184,53 @@ async def test_ensure_dependencies_leaves_existing_peer_untouched(
         )
     )
     assert existing.internal_metadata == {"card": "TARGET"}  # NOT clobbered
+
+
+@pytest.mark.asyncio
+async def test_relocate_preserves_id_and_moves_children(db_session: AsyncSession):
+    await _mk_workspace(db_session, "personal")
+    await _mk_workspace(db_session, "highway")
+    db_session.add(
+        models.Peer(name="robsherman", workspace_name="highway")
+    )  # target peer exists
+    db_session.add(models.Session(name="s1", workspace_name="personal"))
+    await db_session.flush()
+    src_sess = await db_session.scalar(
+        select(models.Session).where(
+            models.Session.workspace_name == "personal",
+            models.Session.name == "s1",
+        )
+    )
+    src_id, src_created = src_sess.id, src_sess.created_at
+    db_session.add(models.Peer(name="robsherman", workspace_name="personal"))
+    await db_session.flush()
+    db_session.add(
+        models.Message(
+            session_name="s1",
+            workspace_name="personal",
+            peer_name="robsherman",
+            content="hi",
+            seq_in_session=0,
+        )
+    )
+    await db_session.flush()
+
+    from scripts.move_session_workspace import ensure_dependencies, relocate_in_place
+
+    await ensure_dependencies(db_session, "personal", "highway", "s1")
+    await relocate_in_place(db_session, "personal", "highway", "s1", "s1")
+    await db_session.flush()
+
+    moved = await db_session.scalar(
+        select(models.Session).where(
+            models.Session.workspace_name == "highway",
+            models.Session.name == "s1",
+        )
+    )
+    assert moved is not None
+    assert moved.id == src_id  # id preserved
+    assert moved.created_at == src_created
+    assert await _count(db_session, models.Message, "highway", "s1") == 1
+    assert await _count(db_session, models.Message, "personal", "s1") == 0
+    # no orphaned source session row
+    assert await _session_row_helper(db_session, "personal", "s1") is None
