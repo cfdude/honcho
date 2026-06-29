@@ -4,6 +4,8 @@ docs/superpowers/specs/2026-06-29-cross-workspace-session-move-design.md."""
 
 from __future__ import annotations
 
+import argparse
+import asyncio
 import os
 import sys
 from dataclasses import dataclass, field
@@ -382,6 +384,91 @@ async def apply_moves(
         )
     await session.flush()
     await _assert_integrity(session, target_ws)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        description="Losslessly move sessions between Honcho workspaces."
+    )
+    p.add_argument("--from", dest="source", required=True)
+    p.add_argument("--to", dest="target", required=True)
+    p.add_argument("--session", action="append", required=True, help="repeatable")
+    p.add_argument("--on-collision", choices=["rename", "skip"], default="rename")
+    p.add_argument("--rename-suffix", default="-from-{source}")
+    p.add_argument("--apply", action="store_true", help="default: dry-run")
+    p.add_argument("--force-clear-queue", action="store_true")
+    p.add_argument("--no-backup", action="store_true")
+    return p
+
+
+def _pg_dump(out_path: str) -> None:
+    import subprocess
+
+    from src.config import settings
+
+    uri = settings.DB.CONNECTION_URI
+    # strip the +psycopg driver suffix for libpq / pg_dump
+    libpq = uri.replace("postgresql+psycopg", "postgresql")
+    subprocess.run(["pg_dump", "--dbname", libpq, "--file", out_path], check=True)
+
+
+def _print_plans(plans: list[SessionPlan], apply: bool) -> None:
+    mode = "APPLY" if apply else "DRY-RUN"
+    print(f"[{mode}] {len(plans)} session(s):")
+    for p in plans:
+        rn = f" -> {p.target_name} (renamed)" if p.renamed else ""
+        print(
+            f"  {p.source_name}{rn}: {p.messages} msgs, {p.documents} docs, "
+            f"{p.embeddings} embeddings; create peers={p.peers_to_create} "
+            f"collections={p.collections_to_create}; queue={p.queue_rows}"
+        )
+        if p.cross_boundary_premises:
+            print(
+                f"    WARNING cross-boundary premises (will dangle): "
+                f"{p.cross_boundary_premises}"
+            )
+
+
+async def main_async(args) -> int:
+    from src.db import SessionLocal
+
+    async with SessionLocal() as session:
+        plans = await plan_moves(
+            session,
+            args.source,
+            args.target,
+            args.session,
+            args.on_collision,
+            args.rename_suffix,
+        )
+        moved = {p.source_name for p in plans}
+        for p in plans:
+            p.cross_boundary_premises = await cross_boundary_premises(
+                session, args.source, moved
+            )
+        _print_plans(plans, apply=args.apply)
+        if not args.apply:
+            return 0
+        if not args.no_backup:
+            import datetime
+
+            path = f"/tmp/honcho-backup-{datetime.datetime.utcnow():%Y%m%dT%H%M%SZ}.sql"
+            _pg_dump(path)
+            print(f"backup written: {path}")
+        async with session.begin():
+            await apply_moves(
+                session, args.source, args.target, plans, args.force_clear_queue
+            )
+        print("move applied.")
+        return 0
+
+
+def main() -> int:
+    return asyncio.run(main_async(build_parser().parse_args()))
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
 
 
 async def plan_moves(

@@ -353,6 +353,18 @@ async def test_dry_run_writes_nothing(db_session: AsyncSession):
     assert before == after == 2  # plan_moves is read-only
 
 
+def test_build_parser_defaults():
+    from scripts.move_session_workspace import build_parser
+
+    args = build_parser().parse_args(
+        ["--from", "personal", "--to", "highway", "--session", "s1"]
+    )
+    assert args.source == "personal" and args.target == "highway"
+    assert args.session == ["s1"]
+    assert args.apply is False  # dry-run default
+    assert args.on_collision == "rename"
+
+
 @pytest.mark.asyncio
 async def test_cross_boundary_premises_flags_only_outside_move_set(
     db_session: AsyncSession,
