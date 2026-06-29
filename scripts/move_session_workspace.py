@@ -62,6 +62,26 @@ async def _count(session: AsyncSession, model, ws: str, name: str) -> int:
     )
 
 
+async def _resolve_target_name(
+    session: AsyncSession,
+    target_ws: str,
+    name: str,
+    on_collision: str,
+    rename_suffix: str,
+    source_ws: str,
+) -> tuple[str, bool, bool]:
+    if await _session_row(session, target_ws, name) is None:
+        return name, False, False
+    if on_collision == "skip":
+        return name, False, True
+    base = name + rename_suffix.format(source=source_ws)
+    candidate, n = base, 1
+    while await _session_row(session, target_ws, candidate) is not None:
+        n += 1
+        candidate = f"{base}-{n}"
+    return candidate, True, False
+
+
 async def plan_moves(
     session: AsyncSession,
     source_ws: str,
@@ -82,11 +102,16 @@ async def plan_moves(
         src = await _session_row(session, source_ws, name)
         if src is None:
             raise MoveError(f"session '{name}' not found in workspace '{source_ws}'")
+        target_name, renamed, skip = await _resolve_target_name(
+            session, target_ws, name, on_collision, rename_suffix, source_ws
+        )
+        if skip:
+            continue
         plans.append(
             SessionPlan(
                 source_name=name,
-                target_name=name,
-                renamed=False,
+                target_name=target_name,
+                renamed=renamed,
                 messages=await _count(session, models.Message, source_ws, name),
                 embeddings=await _count(
                     session, models.MessageEmbedding, source_ws, name

@@ -57,3 +57,30 @@ async def test_plan_rejects_missing_session(db_session: AsyncSession):
     await _mk_workspace(db_session, "highway")
     with pytest.raises(MoveError, match="not found"):
         await plan_moves(db_session, "personal", "highway", ["nope"])
+
+
+@pytest.mark.asyncio
+async def test_plan_renames_on_collision(db_session: AsyncSession):
+    await _mk_workspace(db_session, "personal")
+    await _mk_workspace(db_session, "highway")
+    await _mk_session_with_messages(db_session, "personal", "maca", "robsherman", 2)
+    await _mk_session_with_messages(
+        db_session, "highway", "maca", "robsherman", 5
+    )  # collision
+
+    plans = await plan_moves(db_session, "personal", "highway", ["maca"])
+    assert plans[0].target_name == "maca-from-personal"
+    assert plans[0].renamed is True
+
+
+@pytest.mark.asyncio
+async def test_plan_skip_mode_leaves_collision(db_session: AsyncSession):
+    await _mk_workspace(db_session, "personal")
+    await _mk_workspace(db_session, "highway")
+    await _mk_session_with_messages(db_session, "personal", "maca", "robsherman", 2)
+    await _mk_session_with_messages(db_session, "highway", "maca", "robsherman", 5)
+
+    plans = await plan_moves(
+        db_session, "personal", "highway", ["maca"], on_collision="skip"
+    )
+    assert plans == []  # skipped, nothing to do
