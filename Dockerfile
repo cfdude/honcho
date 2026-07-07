@@ -48,4 +48,4 @@ USER app
 
 EXPOSE 8000
 
-CMD ["fastapi", "run", "--host", "0.0.0.0", "src/main.py"]
+CMD ["sh", "docker/entrypoint.sh"]
