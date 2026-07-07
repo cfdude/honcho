@@ -17,13 +17,12 @@ ENV UV_LINK_MODE=copy
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 
-# Install the project's dependencies using the lockfile and settings
-RUN --mount=type=bind,source=uv.lock,target=uv.lock \
-    --mount=type=bind,source=pyproject.toml,target=pyproject.toml \
-    uv sync --frozen --no-install-project --no-group dev
-
-# Copy only requirements to cache them in docker layer
+# Copy the lockfile + project metadata first (no BuildKit --mount: Railway's
+# Railpack builder rejects both type=bind and unscoped type=cache mounts)
 COPY uv.lock pyproject.toml /app/
+
+# Install the project's dependencies using the lockfile and settings
+RUN uv sync --frozen --no-install-project --no-group dev
 
 # Sync the project
 RUN uv sync --frozen --no-group dev
