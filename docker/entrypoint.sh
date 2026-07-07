@@ -15,4 +15,6 @@ echo "Running database migrations..."
 /app/.venv/bin/python scripts/provision_db.py
 
 echo "Starting API server..."
-exec /app/.venv/bin/fastapi run --host 0.0.0.0 src/main.py
+# Bind IPv6 (dual-stack) so the app is reachable over Railway's private network,
+# which is IPv6 (fd12::/16). A 0.0.0.0 (IPv4-only) bind is unreachable there.
+exec /app/.venv/bin/fastapi run --host :: src/main.py
