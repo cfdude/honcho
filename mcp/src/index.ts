@@ -1,5 +1,6 @@
 import { createMcpHandler } from "agents/mcp";
 import {
+  accessHeaders,
   parseConfig,
   createClientFactory,
   createUnscopedClient,
@@ -42,6 +43,11 @@ export default {
     let failure: string | null = null;
     try {
       const response = await fetch(upstream, {
+        // The probe must carry the same Cloudflare Access service token the
+        // tool calls use. Without it an Access-fronted upstream answers 403
+        // with a login page, and this cron would alert every 5 minutes on a
+        // perfectly healthy API.
+        headers: accessHeaders(env),
         signal: AbortSignal.timeout(HEALTHCHECK_TIMEOUT_MS),
       });
       if (!response.ok) failure = `HTTP ${response.status}`;
