@@ -5,11 +5,42 @@ export interface HonchoConfig {
   baseUrl: string;
   /** From X-Honcho-Workspace-ID when set. */
   workspaceId?: string;
+  /**
+   * Extra headers sent on every upstream request. Empty unless the operator
+   * has put the API behind Cloudflare Access — see `accessHeaders`.
+   */
+  extraHeaders?: Record<string, string>;
 }
 
 export interface Env {
   HONCHO_API_URL?: string;
   ALERT_WEBHOOK_URL?: string;
+  /**
+   * Cloudflare Access service-token pair, set as Worker secrets. Only needed
+   * when HONCHO_API_URL points at a self-hosted instance fronted by
+   * Cloudflare Access (an Access-protected hostname answers an unauthenticated
+   * request with a 403 login page, not the API).
+   */
+  HONCHO_ACCESS_CLIENT_ID?: string;
+  HONCHO_ACCESS_CLIENT_SECRET?: string;
+}
+
+/**
+ * Cloudflare Access service-token headers, or `{}` when the pair is not
+ * configured.
+ *
+ * Both halves are required: sending one alone is not a partial credential,
+ * it is an invalid one, and Access rejects it exactly as it rejects none.
+ * Returning `{}` in that case keeps the failure legible (a 403 that says
+ * "no credentials") instead of masking a half-configured deployment.
+ *
+ * Deployments not behind Access set neither var and are unaffected.
+ */
+export function accessHeaders(env: Env = {}): Record<string, string> {
+  const id = env.HONCHO_ACCESS_CLIENT_ID?.trim();
+  const secret = env.HONCHO_ACCESS_CLIENT_SECRET?.trim();
+  if (!id || !secret) return {};
+  return { "CF-Access-Client-Id": id, "CF-Access-Client-Secret": secret };
 }
 
 /**
@@ -45,6 +76,7 @@ export function parseConfig(request: Request, env: Env = {}): HonchoConfig {
     apiKey,
     baseUrl: env.HONCHO_API_URL?.trim() || "https://api.honcho.dev",
     workspaceId,
+    extraHeaders: accessHeaders(env),
   };
 }
 
@@ -70,6 +102,9 @@ export function createClient(
     apiKey: config.apiKey,
     baseURL: config.baseUrl,
     workspaceId,
+    ...(config.extraHeaders && Object.keys(config.extraHeaders).length > 0
+      ? { defaultHeaders: config.extraHeaders }
+      : {}),
   });
 }
 
@@ -78,6 +113,9 @@ export function createUnscopedClient(config: HonchoConfig): Honcho {
   return new Honcho({
     apiKey: config.apiKey,
     baseURL: config.baseUrl,
+    ...(config.extraHeaders && Object.keys(config.extraHeaders).length > 0
+      ? { defaultHeaders: config.extraHeaders }
+      : {}),
   });
 }
 
