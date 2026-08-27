@@ -17,6 +17,16 @@ name = "honcho-mcp"
 
 [env.staging]
 name = "honcho-mcp-staging"
+# FORK: served from a custom domain on onvex.io, not workers.dev, so Cloudflare
+# Access can be applied to it — Access cannot protect a *.workers.dev hostname
+# because that zone belongs to Cloudflare, not to us. workers_dev is disabled
+# so the unprotected .workers.dev route is not left open as a way around it.
+# The Access application itself is Terraform, in
+# honcho-deploy/infra/cloudflare/main.tf.
+workers_dev = false
+routes = [
+  { pattern = "honcho-mcp-staging.onvex.io", custom_domain = true },
+]
 
 [observability.logs]
 enabled = true
