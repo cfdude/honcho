@@ -14,6 +14,18 @@ crons = ["*/5 * * * *"]
 
 [env.production]
 name = "honcho-mcp"
+# FORK: same reasoning as [env.staging] below — Access cannot protect a
+# *.workers.dev hostname, so production is served from a custom domain and
+# workers_dev is disabled. These MUST be set per-environment: wrangler does not
+# inherit workers_dev or routes from a sibling environment, so omitting them
+# here would publish honcho-mcp.onvex.workers.dev unprotected, holding the same
+# Cloudflare Access service token as a secret — exactly the hole the staging
+# config closes. The Access application is Terraform, in
+# honcho-deploy/infra/cloudflare/main.tf.
+workers_dev = false
+routes = [
+  { pattern = "honcho-mcp.onvex.io", custom_domain = true },
+]
 
 [env.staging]
 name = "honcho-mcp-staging"
