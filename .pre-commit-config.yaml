@@ -1,5 +1,13 @@
 # .pre-commit-config.yaml
 repos:
+  # Secret scanning. REQUIRED: `pre-commit install` overwrites
+  # .git/hooks/pre-commit and destroys the `git secrets` hook that
+  # ~/.git-templates installs at clone time. Without this the repo has
+  # NO secret scanning at all.
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.30.1
+    hooks:
+      - id: gitleaks
   # Basic file checks (run on all files)
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v4.5.0
