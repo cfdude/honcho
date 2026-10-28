@@ -25,9 +25,11 @@ from src.telemetry.events import ALL_EVENT_TYPES, HIGH_VOLUME_EVENT_TYPES
 from src.telemetry.events.base import BaseEvent
 from src.telemetry.prometheus.metrics import (
     _DERIVER_TOKEN_COMBOS_BY_TASK,  # pyright: ignore[reportPrivateUsage]
+    SUMMARY_REJECTION_DEGENERATE,
     DeriverComponents,
     DeriverTaskTypes,
     DialecticComponents,
+    PaginationShimOutcomes,
     TokenTypes,
     prometheus_metrics,
 )
@@ -131,6 +133,19 @@ def test_deriver_token_combos_are_valid_and_complete():
     ) not in ingestion
 
 
+_API_DERIVER_METRIC_GAUGES = (
+    "deriver_outstanding_work_seconds",
+    "deriver_queue_work_units_eligible",
+    "deriver_queue_work_units_claimed",
+    "deriver_queue_items_pending",
+    "deriver_queue_oldest_pending_age_seconds",
+    "dreams_due",
+    "message_embeddings_pending_due",
+)
+
+_SHARED_DERIVER_METRIC_GAUGES = ("message_embeddings_pending",)
+
+
 # ---------------------------------------------------------------------------
 # API-process zero-init
 # ---------------------------------------------------------------------------
@@ -161,6 +176,8 @@ def test_api_init_materializes_dialectic_and_embed():
             )
     assert sample("embed_now_tasks_shed_total") is not None
     assert sample("embed_now_tasks_in_flight") == 0.0  # gauge, explicit .set(0)
+    for gauge in (*_API_DERIVER_METRIC_GAUGES, *_SHARED_DERIVER_METRIC_GAUGES):
+        assert sample(gauge) == 0.0, f"{gauge} was not zero-initialized"
 
 
 @pytest.mark.usefixtures("metrics_enabled")
@@ -212,6 +229,15 @@ def test_deriver_init_materializes_token_and_backlog():
             )
             is not None
         ), f"specialist {specialist_name!r} was not zero-initialized"
+    for summary_type in ("short", "long"):
+        assert (
+            sample(
+                "summary_rejections_total",
+                summary_type=summary_type,
+                reason=SUMMARY_REJECTION_DEGENERATE,
+            )
+            is not None
+        )
     assert sample("message_embeddings_pending") == 0.0  # gauge zero-init
 
 
@@ -310,6 +336,26 @@ def test_deriver_init_does_not_touch_api_counters():
     # the API-process embed_now counters are equally off-limits
     assert sample("embed_now_tasks_shed_total") is None
     assert sample("embed_now_tasks_in_flight") is None
+    # so are the deriver-work gauges: the deriver never measures its own backlog
+    for gauge in _API_DERIVER_METRIC_GAUGES:
+        assert sample(gauge) is None, f"{gauge} must be API-only"
+
+
+@pytest.mark.usefixtures("metrics_enabled")
+@pytest.mark.parametrize("scheduler", ["api", "deriver"])
+@pytest.mark.parametrize("instance_type", ["api", "deriver"])
+def test_backfill_pending_zero_init_follows_scheduler(
+    monkeypatch: pytest.MonkeyPatch, scheduler: str, instance_type: str
+):
+    """Only the process running the reconciler scheduler refreshes the gauge."""
+    from src.reconciler.backfill import BACKFILLS
+
+    monkeypatch.setattr("src.config.settings.DERIVER.SCHEDULER", scheduler)
+    prometheus_metrics.initialize_bounded_metrics(instance_type=instance_type)
+    expected = 0.0 if scheduler == instance_type else None
+    assert BACKFILLS
+    for name in BACKFILLS:
+        assert sample("backfill_pending", task=name) == expected
 
 
 # ---------------------------------------------------------------------------
@@ -355,3 +401,33 @@ def test_init_noop_when_metrics_disabled(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr("src.config.settings.METRICS.NAMESPACE", unique_ns("disabled"))
     prometheus_metrics.initialize_bounded_metrics(instance_type="api")
     assert sample("telemetry_events_emitted_total", type="message.created") is None
+
+
+# ---------------------------------------------------------------------------
+# Pagination offset shim
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.usefixtures("metrics_enabled")
+@pytest.mark.parametrize(
+    ("instance_type", "cache_enabled", "shim", "materialized"),
+    [
+        ("api", True, True, True),
+        ("api", False, True, False),  # the shim only runs with the cache on
+        ("api", True, False, False),  # ... and the flag on
+        ("deriver", True, True, False),  # the deriver serves no list routes
+    ],
+)
+def test_pagination_offset_shim_init_follows_where_it_can_run(
+    monkeypatch: pytest.MonkeyPatch,
+    instance_type: str,
+    cache_enabled: bool,
+    shim: bool,
+    materialized: bool,
+):
+    monkeypatch.setattr(settings.CACHE, "ENABLED", cache_enabled)
+    monkeypatch.setattr(settings.CACHE, "PAGINATION_OFFSET_SHIM", shim)
+    prometheus_metrics.initialize_bounded_metrics(instance_type=instance_type)
+    for outcome in PaginationShimOutcomes:
+        value = sample("pagination_offset_shim_total", outcome=outcome.value)
+        assert value == (0.0 if materialized else None)

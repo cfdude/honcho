@@ -16,6 +16,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 from nanoid import generate as generate_nanoid
 from prometheus_client import Counter
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src import crud, models, schemas
@@ -31,11 +32,15 @@ from src.schemas import (
 from src.telemetry.prometheus.metrics import (
     deriver_tokens_processed_counter,
     dialectic_tokens_processed_counter,
+    summary_rejections_counter,
 )
 from src.utils.representation import ExplicitObservationBase, PromptRepresentation
 from src.utils.summarizer import (
+    SUMMARIES_KEY,
+    Summary,
     SummaryType,
     _create_and_save_summary,
+    _save_summary,
     estimate_short_summary_prompt_tokens,
 )
 
@@ -79,9 +84,9 @@ class PrometheusMetricChecker:
     ) -> None:
         """Assert that the delta matches expected value."""
         delta = self.get_delta(counter, labels, before)
-        assert (
-            delta == expected
-        ), f"{message}: expected delta {expected}, got {delta}. Labels: {labels}"
+        assert delta == expected, (
+            f"{message}: expected delta {expected}, got {delta}. Labels: {labels}"
+        )
 
 
 @pytest.fixture
@@ -386,6 +391,202 @@ class TestDeriverIngestionMetrics:
 
 
 # =============================================================================
+# Summary degeneration guard (#899)
+# =============================================================================
+
+_DEGENERATE_SUMMARY_TEXT = "Human. Forever. Human. Always. Human value. Always. " * 300
+
+
+@pytest.mark.asyncio
+class TestSummaryDegenerationGuard:
+    """Persistence-boundary tests for the #899 degeneration guard."""
+
+    async def test_degenerate_cap_hit_does_not_save_summary(
+        self,
+        db_session: AsyncSession,
+        sample_data: tuple[Workspace, Peer],
+        prometheus_test_setup: PrometheusMetricChecker,
+    ):
+        """Degenerate max_tokens summary must not call _save_summary and must count rejection."""
+        metric_checker = prometheus_test_setup
+        workspace, peer = sample_data
+        session = await create_test_session_with_peer(db_session, workspace, peer)
+        messages = await create_test_messages(
+            db_session, workspace.name, session.name, peer.name, count=5
+        )
+        last_message = messages[-1]
+
+        mock_response = HonchoLLMCallResponse(
+            content=_DEGENERATE_SUMMARY_TEXT,
+            input_tokens=20000,
+            output_tokens=4000,
+            finish_reasons=["max_tokens"],
+        )
+
+        rejection_labels = {
+            "namespace": "test",
+            "summary_type": "long",
+            "reason": "degenerate_repetition",
+        }
+        before = metric_checker.capture(summary_rejections_counter, rejection_labels)
+
+        with (
+            patch(
+                "src.utils.summarizer.create_long_summary",
+                new=AsyncMock(return_value=mock_response),
+            ),
+            patch(
+                "src.utils.summarizer._save_summary",
+                new=AsyncMock(),
+            ) as mock_save,
+        ):
+            await _create_and_save_summary(
+                workspace_name=workspace.name,
+                session_name=session.name,
+                message_id=last_message.id,
+                message_seq_in_session=last_message.seq_in_session,
+                summary_type=SummaryType.LONG,
+                message_public_id=last_message.public_id,
+                configuration=create_test_configuration(),
+            )
+
+        mock_save.assert_not_awaited()
+        metric_checker.assert_delta(
+            summary_rejections_counter,
+            rejection_labels,
+            before,
+            1,
+            "Summary rejection counter",
+        )
+
+
+# =============================================================================
+# NUL in summaries (DEV-2535): jsonb rejects it
+# =============================================================================
+
+
+def _stored_summary(
+    content: str, message: models.Message, summary_type: SummaryType
+) -> Summary:
+    return Summary(
+        content=content,
+        message_id=message.id,
+        summary_type=summary_type.value,
+        created_at="2026-01-01T00:00:00+00:00",
+        token_count=3,
+        message_public_id=message.public_id,
+    )
+
+
+async def _stored_summaries(
+    db_session: AsyncSession, workspace_name: str, session_name: str
+) -> dict[str, Summary]:
+    # Select the column so the committed row is read, not the identity map.
+    metadata = await db_session.scalar(
+        select(models.Session.internal_metadata).where(
+            models.Session.workspace_name == workspace_name,
+            models.Session.name == session_name,
+        )
+    )
+    assert metadata is not None
+    return metadata.get(SUMMARIES_KEY, {})
+
+
+@pytest.mark.asyncio
+class TestSummaryNulPersistence:
+    """Persistence-boundary tests: NUL never reaches the jsonb write."""
+
+    async def _run_short_summary(
+        self,
+        workspace: Workspace,
+        session: models.Session,
+        last_message: models.Message,
+        content: str,
+    ) -> None:
+        mock_response = HonchoLLMCallResponse(
+            content=content,
+            input_tokens=100,
+            output_tokens=7,
+            finish_reasons=["stop"],
+        )
+        with patch(
+            "src.utils.summarizer.create_short_summary",
+            new=AsyncMock(return_value=mock_response),
+        ):
+            await _create_and_save_summary(
+                workspace_name=workspace.name,
+                session_name=session.name,
+                message_id=last_message.id,
+                message_seq_in_session=last_message.seq_in_session,
+                summary_type=SummaryType.SHORT,
+                message_public_id=last_message.public_id,
+                configuration=create_test_configuration(),
+            )
+
+    async def test_nul_only_summary_keeps_previous(
+        self, db_session: AsyncSession, sample_data: tuple[Workspace, Peer]
+    ):
+        """A clean-stop NUL-only summary is not saved; the previous one stays."""
+        workspace, peer = sample_data
+        session = await create_test_session_with_peer(db_session, workspace, peer)
+        messages = await create_test_messages(
+            db_session, workspace.name, session.name, peer.name, count=5
+        )
+        previous = _stored_summary("Earlier summary.", messages[0], SummaryType.SHORT)
+        await _save_summary(db_session, previous, workspace.name, session.name)
+
+        await self._run_short_summary(workspace, session, messages[-1], "\x00 \x00")
+
+        stored = await _stored_summaries(db_session, workspace.name, session.name)
+        assert stored[SummaryType.SHORT.value] == previous
+
+    async def test_summary_with_nul_is_saved_stripped(
+        self, db_session: AsyncSession, sample_data: tuple[Workspace, Peer]
+    ):
+        """Mixed content is saved without NUL; the provider token count is kept."""
+        workspace, peer = sample_data
+        session = await create_test_session_with_peer(db_session, workspace, peer)
+        messages = await create_test_messages(
+            db_session, workspace.name, session.name, peer.name, count=5
+        )
+
+        await self._run_short_summary(
+            workspace, session, messages[-1], "Alice\x00 asked about Bob."
+        )
+
+        stored = await _stored_summaries(db_session, workspace.name, session.name)
+        short = stored[SummaryType.SHORT.value]
+        assert short["content"] == "Alice asked about Bob."
+        assert short["token_count"] == 7
+        assert short["message_id"] == messages[-1].id
+
+    async def test_save_summary_strips_nul_and_keeps_sibling(
+        self, db_session: AsyncSession, sample_data: tuple[Workspace, Peer]
+    ):
+        """The `_save_summary` backstop strips NUL on direct calls too, and the
+        merge leaves the other summary type intact."""
+        workspace, peer = sample_data
+        session = await create_test_session_with_peer(db_session, workspace, peer)
+        messages = await create_test_messages(
+            db_session, workspace.name, session.name, peer.name, count=2
+        )
+        long_summary = _stored_summary("Long summary.", messages[0], SummaryType.LONG)
+        await _save_summary(db_session, long_summary, workspace.name, session.name)
+
+        raw = _stored_summary(
+            "Short\x00 summary. Literal \\u0000 stays.", messages[1], SummaryType.SHORT
+        )
+        await _save_summary(db_session, raw, workspace.name, session.name)
+
+        stored = await _stored_summaries(db_session, workspace.name, session.name)
+        assert stored[SummaryType.SHORT.value]["content"] == (
+            "Short summary. Literal \\u0000 stays."
+        )
+        assert stored[SummaryType.LONG.value] == long_summary
+        assert raw["content"] == "Short\x00 summary. Literal \\u0000 stays."
+
+
+# =============================================================================
 # Deriver Summary Metrics Tests
 # =============================================================================
 
@@ -591,9 +792,9 @@ class TestDeriverSummaryMetrics:
         delta = metric_checker.get_delta(
             deriver_tokens_processed_counter, labels, before
         )
-        assert (
-            delta == expected_messages_tokens
-        ), f"Expected messages input tokens {expected_messages_tokens}, got {delta}"
+        assert delta == expected_messages_tokens, (
+            f"Expected messages input tokens {expected_messages_tokens}, got {delta}"
+        )
         assert delta > 0, "Expected at least some message tokens to be tracked"
 
     async def test_summary_fallback_does_not_track(
@@ -663,12 +864,12 @@ class TestDeriverSummaryMetrics:
             deriver_tokens_processed_counter, prompt_labels, before_prompt
         )
 
-        assert (
-            output_delta == 0
-        ), f"Expected no output token change on fallback, got {output_delta}"
-        assert (
-            prompt_delta == 0
-        ), f"Expected no prompt token change on fallback, got {prompt_delta}"
+        assert output_delta == 0, (
+            f"Expected no output token change on fallback, got {output_delta}"
+        )
+        assert prompt_delta == 0, (
+            f"Expected no prompt token change on fallback, got {prompt_delta}"
+        )
 
 
 # =============================================================================
@@ -837,9 +1038,9 @@ class TestDialecticTokenMetrics:
             dialectic_tokens_processed_counter, output_labels, before_output
         )
 
-        assert (
-            input_delta == 0
-        ), f"Expected no input token change when disabled, got {input_delta}"
-        assert (
-            output_delta == 0
-        ), f"Expected no output token change when disabled, got {output_delta}"
+        assert input_delta == 0, (
+            f"Expected no input token change when disabled, got {input_delta}"
+        )
+        assert output_delta == 0, (
+            f"Expected no output token change when disabled, got {output_delta}"
+        )

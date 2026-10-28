@@ -16,7 +16,7 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 import sentry_sdk
@@ -26,13 +26,27 @@ from sqlalchemy import func, select
 from src import crud, models
 from src.config import settings
 from src.dependencies import tracked_db
+from src.dreamer.dream_scheduler import (
+    WORK_LIST_BACKLOG_KEY,
+    schedule_backlog_dream,
+)
 from src.dreamer.specialists import (
     SPECIALISTS,
     CardRefreshSpecialist,
     SpecialistResult,
 )
 from src.dreamer.surprisal import SurprisalScore  # type: ignore
+from src.dreamer.working_memory import (
+    NOTES_KEY,
+    DreamState,
+    advance_cursor,
+    clear_position,
+    load_dream_state,
+    plan_cursor_move,
+)
 from src.exceptions import SurprisalError
+from src.llm.runtime import CapturedAgentSpan, start_captured_span
+from src.llm.types import LLMTelemetryContext
 from src.schemas import DreamType
 from src.telemetry.events import DreamRunEvent, emit
 from src.telemetry.logging import (
@@ -67,6 +81,49 @@ class DreamResult:
     input_tokens: int
     output_tokens: int
 
+    # Working state shown to the specialists, when the brief or notes are on
+    state: DreamState | None = None
+
+
+def working_memory_enabled() -> bool:
+    """Whether dreams keep the cursor: needed by the work list and by notes."""
+    return settings.DREAM.BRIEF_ENABLED or settings.DREAM.NOTES_MODE != "off"
+
+
+def _start_dream_trace(
+    run_id: str,
+    *,
+    workspace_name: str,
+    observer: str,
+    observed: str,
+    session_name: str | None,
+    session_id: str | None,
+    dream_type: str | None,
+) -> CapturedAgentSpan | None:
+    """Open the dream's trace root for span-tree exporters."""
+    telemetry = LLMTelemetryContext(
+        workspace_name=workspace_name,
+        parent_category="dream",
+        run_id=run_id,
+        trace_id=run_id,
+        span_id=run_id,
+        session_id=session_id,
+        observer=observer,
+        observed=observed,
+        peer_name=observed,
+        track_name="Dream",
+    )
+    return start_captured_span(
+        "trace",
+        telemetry,
+        input={
+            "observer": observer,
+            "observed": observed,
+            "session_name": session_name,
+            "dream_type": dream_type,
+        },
+    )
+
 
 async def run_dream(
     workspace_name: str,
@@ -79,6 +136,7 @@ async def run_dream(
     delay_reason: str | None = None,
     documents_since_last_dream_at_schedule: int | None = None,
     document_threshold: int | None = None,
+    queue_item_id: int | None = None,
 ) -> DreamResult | None:
     """
     Run a full dream cycle with optional surprisal-based sampling.
@@ -118,6 +176,7 @@ async def run_dream(
 
         workspace = await crud.get_workspace(db, workspace_name=workspace_name)
         configuration = get_configuration(None, session, workspace)
+        resolved_session_id = session.id if session else None
     if not configuration.dream.enabled:
         logger.info(
             f"[{run_id}] Dreams disabled for {workspace_name}/{session_name}, skipping dream"
@@ -130,6 +189,16 @@ async def run_dream(
     surprisal_observation_count = 0
     deduction_result: SpecialistResult | None = None
     induction_result: SpecialistResult | None = None
+
+    dream_trace = _start_dream_trace(
+        run_id,
+        workspace_name=workspace_name,
+        observer=observer,
+        observed=observed,
+        session_name=session_name,
+        session_id=resolved_session_id,
+        dream_type=dream_type,
+    )
 
     # Surprisal-based sampling (if enabled)
     # Specialists are self-directed by default - hints are optional suggestions
@@ -175,6 +244,22 @@ async def run_dream(
             accumulate_metric(task_name, "surprisal_error", str(e), "blob")
             # Specialists will explore freely without hints
 
+    # Loaded once for both specialists, so deduction's writes don't change the
+    # work list induction is shown and the cursor advances once per dream.
+    state: DreamState | None = None
+    if working_memory_enabled():
+        try:
+            state = await load_dream_state(
+                workspace_name,
+                observer=observer,
+                observed=observed,
+                include_work_list=settings.DREAM.BRIEF_ENABLED,
+            )
+        except Exception as e:
+            logger.error(
+                f"[{run_id}] Loading dream working state failed: {e}", exc_info=True
+            )
+
     # Specialist phase wrapped in try/finally so DreamRunEvent ALWAYS emits —
     # both for graceful failures (specialist raises Exception) AND unexpected
     # exceptions including CancelledError. The orphaned-child-event problem
@@ -204,6 +289,9 @@ async def run_dream(
                 hints=exploration_hints,
                 configuration=configuration,
                 parent_run_id=run_id,
+                session_id=resolved_session_id,
+                queue_item_id=queue_item_id,
+                state=state,
             )
             logger.info(
                 f"[{run_id}] Deduction completed: {deduction_result.content[:200]}..."
@@ -232,6 +320,9 @@ async def run_dream(
                 hints=exploration_hints,
                 configuration=configuration,
                 parent_run_id=run_id,
+                session_id=resolved_session_id,
+                queue_item_id=queue_item_id,
+                state=state,
             )
             logger.info(
                 f"[{run_id}] Induction completed: {induction_result.content[:200]}..."
@@ -258,6 +349,14 @@ async def run_dream(
         # schema-validation surprises during partial state.
         if duration_ms == 0.0:
             duration_ms = (time.perf_counter() - start_time) * 1000
+        if dream_trace is not None:
+            dream_trace.end(
+                output={
+                    "deduction": deduction_result.content if deduction_result else None,
+                    "induction": induction_result.content if induction_result else None,
+                },
+                is_error=not (deduction_success and induction_success),
+            )
         try:
             total_iterations = (
                 deduction_result.iterations if deduction_result else 0
@@ -308,6 +407,7 @@ async def run_dream(
         total_duration_ms=duration_ms,
         input_tokens=total_input_tokens,
         output_tokens=total_output_tokens,
+        state=state,
     )
 
 
@@ -321,6 +421,7 @@ async def run_card_refresh_dream(
     dream_type: str | None = None,
     trigger_reason: str | None = None,
     delay_reason: str | None = None,
+    queue_item_id: int | None = None,
 ) -> DreamResult | None:
     """
     Run a lightweight card-only refresh dream.
@@ -360,6 +461,7 @@ async def run_card_refresh_dream(
 
         workspace = await crud.get_workspace(db, workspace_name=workspace_name)
         configuration = get_configuration(None, session, workspace)
+        resolved_session_id = session.id if session else None
     if not configuration.dream.enabled:
         logger.info(
             f"[{run_id}] Dreams disabled for {workspace_name}/{session_name}, skipping card refresh"
@@ -374,6 +476,15 @@ async def run_card_refresh_dream(
     specialist_success = False
     specialist_result: SpecialistResult | None = None
     duration_ms = 0.0
+    dream_trace = _start_dream_trace(
+        run_id,
+        workspace_name=workspace_name,
+        observer=observer,
+        observed=observed,
+        session_name=session_name,
+        session_id=resolved_session_id,
+        dream_type=dream_type,
+    )
     try:
         specialist = CardRefreshSpecialist(rebuild=rebuild)
         try:
@@ -384,6 +495,8 @@ async def run_card_refresh_dream(
                 session_name=session_name,
                 configuration=configuration,
                 parent_run_id=run_id,
+                session_id=resolved_session_id,
+                queue_item_id=queue_item_id,
             )
             logger.info(
                 f"[{run_id}] Card refresh completed: {specialist_result.content[:200]}..."
@@ -410,6 +523,11 @@ async def run_card_refresh_dream(
         # deduction-family run, so its outcome rides on deduction_success.
         if duration_ms == 0.0:
             duration_ms = (time.perf_counter() - start_time) * 1000
+        if dream_trace is not None:
+            dream_trace.end(
+                output=specialist_result.content if specialist_result else None,
+                is_error=not specialist_success,
+            )
         try:
             emit(
                 DreamRunEvent(
@@ -484,6 +602,8 @@ def _create_queries_from_surprisal(
 async def process_dream(
     payload: DreamPayload,
     workspace_name: str,
+    *,
+    queue_item_id: int | None = None,
 ) -> None:
     """
     Process a dream task by performing collection maintenance operations.
@@ -512,6 +632,7 @@ DREAM: {payload.dream_type} documents for {workspace_name}/{payload.observer}/{p
                     delay_reason=payload.delay_reason,
                     documents_since_last_dream_at_schedule=payload.documents_since_last_dream_at_schedule,
                     document_threshold=payload.document_threshold,
+                    queue_item_id=queue_item_id,
                 )
 
                 # Log completion (telemetry event already emitted in run_dream)
@@ -522,8 +643,27 @@ DREAM: {payload.dream_type} documents for {workspace_name}/{payload.observer}/{p
                         + f"duration={result.total_duration_ms:.0f}ms"
                     )
 
+                    any_succeeded = result.deduction_success or result.induction_success
+                    all_succeeded = (
+                        result.deduction_success and result.induction_success
+                    )
+                    # Work-list conclusions this dream left for the next one.
+                    # They are kept out of the recorded count, so the scheduler
+                    # still sees them as new, and a follow-up dream is
+                    # scheduled for them below.
+                    backlog = 0
+                    if working_memory_enabled() and result.state is not None:
+                        _, backlog = plan_cursor_move(
+                            result.state,
+                            any_specialist_succeeded=any_succeeded,
+                            all_specialists_succeeded=all_succeeded,
+                        )
+                    # When nothing ran, the next dream waits for new
+                    # conclusions rather than retrying on a timer.
+                    follow_up = backlog if any_succeeded else 0
+
                     # Both guard fields advance together only on successful consolidation.
-                    now_iso = datetime.now(timezone.utc).isoformat()
+                    now_iso = datetime.now(UTC).isoformat()
                     async with tracked_db("dream.guard_pair_write") as db:
                         collection = await crud.get_collection(
                             db,
@@ -541,13 +681,45 @@ DREAM: {payload.dream_type} documents for {workspace_name}/{payload.observer}/{p
                         current_explicit_count = int(await db.scalar(count_stmt) or 0)
                         dream_meta = dict(collection.internal_metadata.get("dream", {}))
                         dream_meta["last_dream_at"] = now_iso
-                        dream_meta["last_dream_document_count"] = current_explicit_count
+                        dream_meta["last_dream_document_count"] = max(
+                            0, current_explicit_count - backlog
+                        )
+                        dream_meta[WORK_LIST_BACKLOG_KEY] = follow_up
+                        update_data: dict[str, Any] = {"dream": dream_meta}
+                        if not working_memory_enabled():
+                            # This dream won't move the cursor, so a stored
+                            # position would be stale when it is turned back on.
+                            cleared = clear_position(
+                                collection.internal_metadata.get(NOTES_KEY)
+                            )
+                            if cleared is not None:
+                                update_data[NOTES_KEY] = cleared
                         await crud.update_collection_internal_metadata(
                             db,
                             workspace_name,
                             payload.observer,
                             payload.observed,
-                            update_data={"dream": dream_meta},
+                            update_data=update_data,
+                        )
+
+                    # Skipped only when nothing ran and nothing was shown.
+                    if working_memory_enabled() and (
+                        any_succeeded or result.state is not None
+                    ):
+                        await advance_cursor(
+                            workspace_name,
+                            observer=payload.observer,
+                            observed=payload.observed,
+                            state=result.state,
+                            run_id=result.run_id,
+                            any_specialist_succeeded=any_succeeded,
+                            all_specialists_succeeded=all_succeeded,
+                        )
+                    if follow_up:
+                        await schedule_backlog_dream(
+                            workspace_name,
+                            observer=payload.observer,
+                            observed=payload.observed,
                         )
 
             case DreamType.CARD_REFRESH:
@@ -561,6 +733,7 @@ DREAM: {payload.dream_type} documents for {workspace_name}/{payload.observer}/{p
                     observed=payload.observed,
                     session_name=payload.session_name,
                     rebuild=payload.rebuild,
+                    queue_item_id=queue_item_id,
                     dream_type=payload.dream_type.value,
                     trigger_reason=payload.trigger_reason,
                     delay_reason=payload.delay_reason,

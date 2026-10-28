@@ -2,10 +2,38 @@
 Custom exceptions for the Honcho application.
 """
 
+import hashlib
 import json
-from typing import Any, final
+from dataclasses import dataclass
+from typing import Any, ClassVar, Literal, Self, final
 
 from src.config import settings
+
+# Mirrors sentry_sdk's LogLevelStr. Redeclared rather than imported so this
+# module stays free of telemetry imports -- src.telemetry.sentry imports from
+# here, and the reverse direction would be a cycle.
+SentryLevel = Literal["fatal", "critical", "error", "warning", "info", "debug"]
+
+
+@final
+@dataclass(frozen=True, slots=True)
+class SentryPolicy:
+    """How ``src.telemetry.sentry.default_before_send`` should treat an exception.
+
+    Attached to an exception class rather than matched on in the filter, so the
+    decision lives next to the error it describes and adding a new exception
+    never means editing the filter.
+
+    Args:
+        level: Event level to report at. Deliberately has no default: whether a
+            kept exception is a page or a line on a graph is the whole decision,
+            so each policy states it outright.
+        fingerprint: Collapse every occurrence into this one Sentry issue.
+            ``None`` leaves Sentry's default grouping alone.
+    """
+
+    level: SentryLevel
+    fingerprint: str | None = None
 
 
 class HonchoException(Exception):
@@ -13,6 +41,11 @@ class HonchoException(Exception):
 
     status_code: int = 500
     detail: str = "An unexpected error occurred"
+
+    # Honcho exceptions are client-facing by default: the caller already sees
+    # them in the HTTP response, so Sentry drops them (``None``). Override with
+    # a SentryPolicy on subclasses that describe a symptom worth watching.
+    sentry_policy: ClassVar[SentryPolicy | None] = None
 
     def __init__(self, detail: str | None = None, status_code: int | None = None):
         self.detail = detail or self.detail
@@ -139,6 +172,123 @@ class RepresentationSaveError(HonchoException):
 
     status_code: int = 500
     detail: str = "Representation save failed for all observers"
+
+
+class DegradedLLMResponseError(HonchoException):
+    """Raised when a structured response came back empty in a way that looks
+    degraded -- truncated or withheld by the provider -- rather than a model
+    that read the input and had nothing to say.
+
+    Raised from a ``validate_response`` hook inside the retried LLM call, so it
+    is retried and reaches the fallback model like a provider error. The message
+    carries the prompt's length and digest, never its text, so a repeat can be
+    correlated across workers without logging user content.
+    """
+
+    status_code: int = 500
+    detail: str = "Structured LLM response was empty and degraded"
+
+    # Raised only after the retry budget and the fallback are spent, so it is
+    # memory or a summary that did not get written: an error, not a client
+    # response. Each subclass gets its own fingerprint so the per-issue spike
+    # alert counts that failure's real rate instead of splitting it by stack.
+    sentry_policy: ClassVar[SentryPolicy | None] = SentryPolicy(
+        level="error", fingerprint="honcho-llm-degraded-empty-response"
+    )
+
+    def __init__(
+        self,
+        detail: str,
+        *,
+        parse_class: str,
+        prompt_bytes: int,
+        prompt_digest: str,
+    ) -> None:
+        super().__init__(detail)
+        self.parse_class: str = parse_class
+        self.prompt_bytes: int = prompt_bytes
+        self.prompt_digest: str = prompt_digest
+
+    @classmethod
+    def for_prompt(
+        cls,
+        prompt: str,
+        *,
+        parse_class: str,
+        finish_reasons: list[str],
+        output_tokens: int,
+    ) -> Self:
+        """Build the error from the prompt that was sent, keeping only its
+        length and a digest."""
+        encoded = prompt.encode("utf-8")
+        prompt_digest = hashlib.sha256(encoded).hexdigest()[:16]
+        return cls(
+            f"{cls.detail} (parse_class={parse_class}, "
+            + f"finish_reasons={finish_reasons}, output_tokens={output_tokens}, "
+            + f"prompt_bytes={len(encoded)}, prompt_sha256={prompt_digest})",
+            parse_class=parse_class,
+            prompt_bytes=len(encoded),
+            prompt_digest=prompt_digest,
+        )
+
+
+@final
+class EmptyRepresentationError(DegradedLLMResponseError):
+    """The deriver's structured response for a batch was empty and degraded."""
+
+    detail: str = "Deriver generated an empty representation"
+    sentry_policy: ClassVar[SentryPolicy | None] = SentryPolicy(
+        level="error", fingerprint="honcho-deriver-degraded-empty-representation"
+    )
+
+
+@final
+class EmptySummaryError(DegradedLLMResponseError):
+    """The summarizer's response was empty and degraded."""
+
+    detail: str = "Summarizer generated an empty summary"
+    sentry_policy: ClassVar[SentryPolicy | None] = SentryPolicy(
+        level="error", fingerprint="honcho-summary-degraded-empty-summary"
+    )
+
+
+@final
+class UpstreamLLMError(HonchoException):
+    """Raised when the upstream model provider is unreachable or failing.
+
+    Distinct from a bug in our own request: the provider (or the proxy in front
+    of it) returned 5xx or refused the connection, so the caller should retry
+    rather than treat the request as malformed.
+    """
+
+    status_code = 503
+    detail = "Upstream language model provider is unavailable"
+
+    # Kept by Sentry, unlike most Honcho errors: an outage is ours to notice,
+    # and the deriver has no status-code metric to notice it in the way the
+    # API does.
+    # Reported at error level because the retry budget and the fallback chain
+    # have both been spent by the time this escapes, so it is a sustained
+    # outage rather than a blip -- and the fingerprint already keeps that to a
+    # single issue rather than one per call site.
+    sentry_policy: ClassVar[SentryPolicy | None] = SentryPolicy(
+        level="error",
+        fingerprint="honcho-upstream-llm-unavailable",
+    )
+
+
+@final
+class StructuredResponseError(HonchoException):
+    """Raised when a chat answer still fails its ``response_format`` schema after
+    the retry budget and the fallback chain are spent."""
+
+    status_code = 422
+    detail = "The model's answer did not match the requested response_format"
+
+    sentry_policy: ClassVar[SentryPolicy | None] = SentryPolicy(
+        level="warning",
+        fingerprint="honcho-dialectic-structured-response-invalid",
+    )
 
 
 class LLMError(Exception):

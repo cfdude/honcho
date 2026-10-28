@@ -1,11 +1,20 @@
 from .collection import (
     get_collection,
+    get_collection_internal_metadata_value,
     get_or_create_collection,
+    invalidate_collection_cache,
+    merge_collection_internal_metadata_value,
     update_collection_internal_metadata,
 )
-from .deriver import get_deriver_status, get_queue_status
+from .deriver import (
+    cleanup_stale_work_units,
+    get_deriver_metrics,
+    get_deriver_status,
+    get_queue_status,
+)
 from .document import (
     CreateDocumentsResult,
+    DocumentLevelSummary,
     create_documents,
     create_observations,
     delete_document,
@@ -19,7 +28,9 @@ from .document import (
     query_documents,
     query_documents_most_derived,
     query_documents_recent,
+    query_explicit_documents_after,
     query_external_vector_document_ids,
+    summarize_documents_by_level,
 )
 from .message import (
     create_messages,
@@ -104,7 +115,12 @@ __all__ = [
     "get_collection",
     "get_or_create_collection",
     "update_collection_internal_metadata",
+    "get_collection_internal_metadata_value",
+    "invalidate_collection_cache",
+    "merge_collection_internal_metadata_value",
     # Deriver
+    "cleanup_stale_work_units",
+    "get_deriver_metrics",
     "get_deriver_status",
     "get_queue_status",
     # Document
@@ -119,6 +135,9 @@ __all__ = [
     "query_documents",
     "query_documents_most_derived",
     "query_documents_recent",
+    "query_explicit_documents_after",
+    "summarize_documents_by_level",
+    "DocumentLevelSummary",
     "query_external_vector_document_ids",
     "delete_document",
     "delete_document_by_id",

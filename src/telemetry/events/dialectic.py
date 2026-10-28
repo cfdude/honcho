@@ -10,10 +10,10 @@ from typing import ClassVar
 
 from pydantic import Field
 
-from src.telemetry.events.base import BaseEvent
+from src.telemetry.events.base import BaseEvent, CustomInstructionsFields
 
 
-class DialecticCompletedEvent(BaseEvent):
+class DialecticCompletedEvent(BaseEvent, CustomInstructionsFields):
     """Emitted when a dialectic (chat) query completes.
 
     Dialectic queries answer questions about peers by gathering context
@@ -75,6 +75,20 @@ class DialecticCompletedEvent(BaseEvent):
             "settings.DIALECTIC.MAX_INPUT_TOKENS. Token-based — fires for the "
             "single-oversized-message case too, not just message-list shrinkage."
         ),
+    )
+
+    # Tool-loop budget (shared with dialectic.completed)
+    hit_iteration_limit: bool = Field(
+        default=False,
+        description="True when the tool loop ran out of iterations and made its final call without a natural stop.",
+    )
+    iteration_limit: int | None = Field(
+        default=None,
+        description="Tool-iteration limit this run was given.",
+    )
+    budget_line_enabled: bool = Field(
+        default=False,
+        description="True when the model was shown how many tool calls it had left.",
     )
 
     def get_resource_id(self) -> str:

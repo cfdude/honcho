@@ -1,13 +1,10 @@
 """FastAPI routes for workspace resources and workspace-scoped operations."""
 
-import json
 import logging
-from collections.abc import AsyncIterator
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Path, Query, Response
 from fastapi.responses import StreamingResponse
-from fastapi_pagination import Page
-from fastapi_pagination.ext.sqlalchemy import apaginate
+from fastapi_pagination.bases import AbstractParams
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -20,10 +17,18 @@ from src.dialectic.chat import workspace_chat, workspace_chat_stream
 from src.exceptions import AuthenticationException, ValidationException
 from src.security import JWTParams, require_auth
 from src.telemetry import prometheus_metrics
+from src.utils.evidence import EvidenceAccumulator
 from src.utils.filter import MAX_SESSION_ALLOWLIST_ENTRIES
+from src.utils.pagination import (
+    CursorPage,
+    Page,
+    paginate_offset_or_cursor,
+    pagination_params,
+)
 from src.utils.schema_conversion import json_response_schema_to_pydantic
 from src.utils.scopes import validate_scope_read_option
 from src.utils.search import search
+from src.utils.sse import format_dialectic_sse_stream
 
 logger = logging.getLogger(__name__)
 
@@ -69,7 +74,7 @@ async def get_or_create_workspace(
 
 @router.post(
     "/list",
-    response_model=Page[schemas.Workspace],
+    response_model=Page[schemas.Workspace] | CursorPage[schemas.Workspace],
     dependencies=[Depends(require_auth(admin=True))],
 )
 async def get_all_workspaces(
@@ -77,6 +82,7 @@ async def get_all_workspaces(
         None, description="Filtering and pagination options for the workspaces list"
     ),
     reverse: bool = Query(False, description="Whether to reverse the order of results"),
+    params: AbstractParams = Depends(pagination_params),
     db: AsyncSession = read_db,
 ):
     """Get all Workspaces, paginated with optional filters."""
@@ -86,9 +92,10 @@ async def get_all_workspaces(
         if filter_param == {}:
             filter_param = None
 
-    return await apaginate(
+    return await paginate_offset_or_cursor(
         db,
         await crud.get_all_workspaces(filters=filter_param, reverse=reverse),
+        params,
     )
 
 
@@ -104,7 +111,11 @@ async def update_workspace(
     ),
     db: AsyncSession = db,
 ):
-    """Update Workspace metadata and/or configuration."""
+    """Replace supplied Workspace metadata and/or configuration.
+
+    An empty configuration object clears explicit settings. Omitted or null fields
+    remain unchanged.
+    """
     # ResourceNotFoundException will be caught by global handler if workspace not found
     honcho_workspace = await crud.update_workspace(
         db, workspace_name=workspace_id, workspace=workspace
@@ -289,6 +300,7 @@ async def schedule_dream(
 
 @router.post(
     "/{workspace_id}/chat",
+    summary="Workspace Chat",
     responses={
         200: {
             "content": {
@@ -305,10 +317,11 @@ async def chat(
     options: schemas.WorkspaceChatOptions = Body(...),
     jwt_params: JWTParams = Depends(require_auth(workspace_name="workspace_id")),
 ):
-    """Query the entire workspace using natural language.
+    """Query the entire workspace using natural language. Runs the Dialectic agent over every peer in the workspace rather than a single (observer, observed) pair: there is no anchor peer and no `target`.
 
-    Pass `scope` to restrict recall to the union of those scopes' member
-    sessions. A scope with no member sessions recalls nothing (fail-closed).
+    Pass `session_id` to narrow message tools to one session, or `scope` to restrict recall to the union of the named scopes' member sessions (always an allowlist, even for a single name; a scope with no member sessions recalls nothing). `session_id` and `scope` are mutually exclusive.
+
+    Set `stream: true` to receive the answer as a `text/event-stream` of `{"delta": {"content": ...}, "done": false}` chunks terminated by `{"done": true}`. Requires a workspace- or admin-level key.
     """
     session_allowlist: list[str] | None = None
     if options.scope is not None:
@@ -343,16 +356,11 @@ async def chat(
             reasoning_level=options.reasoning_level,
         )
 
+    evidence = EvidenceAccumulator() if options.include_evidence else None
+
     if options.stream:
-
-        async def format_sse_stream(chunks: AsyncIterator[str]) -> AsyncIterator[str]:
-            """Format chunks as SSE events."""
-            async for chunk in chunks:
-                yield f"data: {json.dumps({'delta': {'content': chunk}, 'done': False})}\n\n"
-            yield f"data: {json.dumps({'done': True})}\n\n"
-
         return StreamingResponse(
-            format_sse_stream(
+            format_dialectic_sse_stream(
                 workspace_chat_stream(
                     workspace_name=workspace_id,
                     session_name=options.session_id,
@@ -360,7 +368,9 @@ async def chat(
                     reasoning_level=options.reasoning_level,
                     response_model=response_model,
                     session_allowlist=session_allowlist,
-                )
+                    evidence=evidence,
+                ),
+                evidence,
             ),
             media_type="text/event-stream",
         )
@@ -372,5 +382,9 @@ async def chat(
         reasoning_level=options.reasoning_level,
         response_model=response_model,
         session_allowlist=session_allowlist,
+        evidence=evidence,
     )
-    return schemas.DialecticResponse(content=response if response else None)
+    return schemas.DialecticResponse(
+        content=response if response else None,
+        evidence=evidence.build() if evidence is not None else None,
+    )

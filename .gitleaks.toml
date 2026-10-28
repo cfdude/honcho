@@ -1,0 +1,42 @@
+# FORK CONFIG. The gitleaks hook is ours, not upstream's (added in e4ea1799), so it
+# meets upstream's test fixtures for the first time on every upstream sync. The
+# 2026-10-28 sync of 201 commits produced 11 findings, every one a fixture:
+#
+#   tests/property/test_api_auth.py        SECRET = "property-test-secret-0123456789ab"
+#                                          WRONG_SECRET = "property-test-wrong-secret-01234567"
+#   tests/llm/test_backends/test_openai.py secret = "my-sentinel-secret-4417"
+#   tests/deriver/...test_deriver_processing.py  the same sentinel
+#   kilo-honcho/tests/tool-capture.test.js "Bearer abc123" INSIDE a redaction test
+#
+# Two rules produced all of them, and both are the known low-confidence ones:
+# generic-api-key (entropy-based) and curl-auth-user. They are allowlisted ONLY
+# inside test paths, and ONLY those two rules — every high-confidence rule (AWS
+# keys, PEM private keys, real provider token formats) stays active everywhere,
+# tests included. A blanket path exclusion would have been easier and would have
+# stopped catching a real key pasted into a test.
+#
+# Fingerprint-level ignores were rejected deliberately: they go stale the moment
+# upstream adds a fixture, which is exactly the recurring papercut this avoids.
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Upstream test fixtures: entropy-based rules only, test paths only"
+targetRules = ["generic-api-key", "curl-auth-user"]
+paths = [
+  '''(^|/)tests?/''',
+  '''_test\.(js|ts|py)$''',
+  '''\.test\.(js|ts)$''',
+  '''(^|/)test_[^/]+\.py$''',
+]
+
+[[allowlists]]
+description = "PostHog project key in upstream's docs consent loader — public by design"
+targetRules = ["generic-api-key"]
+paths = ['''^docs/posthog-consent\.js$''']
+# A `phc_...` PostHog PROJECT key is write-only ingestion credential that is meant
+# to ship in client-side JavaScript; PostHog documents it as safe to expose. This
+# one is upstream's, committed in 86f8eb3e, and is served to every reader of their
+# docs site. Not ours to rotate, and not a leak. Scoped to the single file so a
+# genuinely private key landing in docs/ elsewhere is still caught.

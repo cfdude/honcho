@@ -3,7 +3,7 @@ Tests for advanced filter functionality including logical operators,
 comparison operators, and wildcards across multiple models.
 """
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from typing import Any, TypedDict
 
 import pytest
@@ -111,21 +111,21 @@ async def test_logical_operators_and_filters(
     found_names = [item["id"] for item in data["items"]]
     expected_names = [peer_names[i] for i in expected_peer_indices]
 
-    assert len(found_names) == len(
-        expected_names
-    ), f"Expected {len(expected_names)} peers for {description}, got {len(found_names)}"
+    assert len(found_names) == len(expected_names), (
+        f"Expected {len(expected_names)} peers for {description}, got {len(found_names)}"
+    )
 
     for expected_name in expected_names:
-        assert (
-            expected_name in found_names
-        ), f"Expected peer {expected_name} in results for {description}"
+        assert expected_name in found_names, (
+            f"Expected peer {expected_name} in results for {description}"
+        )
 
     # Verify unexpected peers are not included
     for i, peer_name in enumerate(peer_names):
         if i not in expected_peer_indices:
-            assert (
-                peer_name not in found_names
-            ), f"Unexpected peer {peer_name} found in results for {description}"
+            assert peer_name not in found_names, (
+                f"Unexpected peer {peer_name} found in results for {description}"
+            )
 
 
 @pytest.mark.parametrize(
@@ -224,21 +224,21 @@ async def test_comparison_operators_filters(
     ]
     found_contents = [item["content"] for item in data["items"]]
 
-    assert (
-        len(found_contents) == len(expected_contents)
-    ), f"Expected {len(expected_contents)} messages for {description}, got {len(found_contents)}"
+    assert len(found_contents) == len(expected_contents), (
+        f"Expected {len(expected_contents)} messages for {description}, got {len(found_contents)}"
+    )
 
     for expected_content in expected_contents:
-        assert (
-            expected_content in found_contents
-        ), f"Expected message '{expected_content}' in results for {description}"
+        assert expected_content in found_contents, (
+            f"Expected message '{expected_content}' in results for {description}"
+        )
 
     # Verify unexpected messages are not included
     for i, message_config in enumerate(message_configs):
         if i not in expected_message_indices:
-            assert (
-                message_config["content"] not in found_contents
-            ), f"Unexpected message '{message_config['content']}' found in results for {description}"
+            assert message_config["content"] not in found_contents, (
+                f"Unexpected message '{message_config['content']}' found in results for {description}"
+            )
 
 
 @pytest.mark.asyncio
@@ -449,6 +449,60 @@ async def test_wildcard_filters(
     data = response.json()
     # Since wildcard should be ignored, this should return all peers
     assert len(data["items"]) >= 3  # At least the 3 peers we know about
+
+
+@pytest.mark.asyncio
+async def test_wildcards_and_empty_filters_inside_logical_operators(
+    client: TestClient, sample_data: tuple[Workspace, Peer]
+):
+    """A wildcard or `{}` constrains nothing, so it is TRUE under every operator.
+
+    These all executed cleanly while returning the wrong rows — OR narrowed to
+    the other operand and NOT returned everything — so they need exact row
+    assertions rather than status-code checks.
+    """
+    test_workspace, _test_peer = sample_data
+
+    peer_names = [str(generate_nanoid()) for _ in range(3)]
+    for name in peer_names:
+        client.post(
+            f"/v3/workspaces/{test_workspace.name}/peers",
+            json={"name": name, "metadata": {"role": "member"}},
+        )
+    bob = peer_names[0]
+
+    def list_names(filters: dict[str, Any]) -> set[str]:
+        """Peer ids the list endpoint returns for `filters`, among this test's peers.
+
+        ANDed with the test's own peers so the expected set is exact. That
+        outer AND does not mask the bug: the operator under test is nested
+        inside it.
+        """
+        response = client.post(
+            f"/v3/workspaces/{test_workspace.name}/peers/list",
+            json={"filters": {"AND": [filters, {"id": {"in": peer_names}}]}},
+        )
+        assert response.status_code == 200, filters
+        return {item["id"] for item in response.json()["items"]}
+
+    everyone = set(peer_names)
+    cases: list[tuple[dict[str, Any], set[str]]] = [
+        ({"id": "*"}, everyone),
+        ({}, everyone),
+        ({"AND": [{"id": "*"}, {"id": bob}]}, {bob}),
+        ({"OR": [{"id": "*"}, {"id": bob}]}, everyone),
+        ({"OR": [{}, {"id": bob}]}, everyone),
+        ({"OR": [{"metadata": {"role": {"in": ["*"]}}}, {"id": bob}]}, everyone),
+        ({"NOT": [{"id": "*"}]}, set()),
+        ({"NOT": [{"id": {"in": [bob, "*"]}}]}, set()),
+        ({"NOT": [{}]}, set()),
+        ({"NOT": [{"metadata": {"role": "*"}}]}, set()),
+        ({"NOT": [{"created_at": {"gte": "*"}}]}, set()),
+        ({"NOT": [{"OR": [{"id": "*"}, {"id": bob}]}]}, set()),
+        ({"NOT": [{"id": bob}]}, everyone - {bob}),
+    ]
+    for filters, expected in cases:
+        assert list_names(filters) == expected, filters
 
 
 @pytest.mark.asyncio
@@ -1619,6 +1673,69 @@ async def test_jsonb_type_casting_edge_cases(
 
 
 @pytest.mark.asyncio
+async def test_numeric_filter_skips_non_numeric_metadata_values(
+    client: TestClient, sample_data: tuple[Workspace, Peer]
+):
+    """A numeric comparison on a key that some rows store as text matches the
+    numeric rows and skips the rest, rather than failing the cast (500)."""
+    test_workspace, test_peer = sample_data
+
+    session_id = str(generate_nanoid())
+    client.post(
+        f"/v3/workspaces/{test_workspace.name}/sessions",
+        json={"id": session_id, "peer_names": {test_peer.name: {}}},
+    )
+    # Arabic-Indic digits and a no-break space can match a locale-aware \d or \s
+    scores: list[Any] = [
+        3,
+        "7",
+        "high",
+        "",
+        " ",
+        "1e200000",
+        True,
+        [1],
+        {"a": 1},
+        "\u0661\u0662",
+        "1\u00a0",
+        10**1000,  # Native JSONB numbers are valid beyond the string safety cap.
+        "NaN",
+        "Infinity",
+        "-Infinity",
+        "1" + "0" * 1000,  # Numeric strings retain the conservative length cap.
+        " \t+7.5e1\r\n",
+    ]
+    client.post(
+        f"/v3/workspaces/{test_workspace.name}/sessions/{session_id}/messages",
+        json={
+            "messages": [
+                {
+                    "content": f"score {i}",
+                    "peer_id": test_peer.name,
+                    "metadata": {"score": score},
+                }
+                for i, score in enumerate(scores)
+            ]
+        },
+    )
+
+    def matching(op: str, value: Any) -> set[str]:
+        response = client.post(
+            f"/v3/workspaces/{test_workspace.name}/sessions/{session_id}/messages/list",
+            json={"filters": {"metadata": {"score": {op: value}}}},
+        )
+        assert response.status_code == 200, response.text
+        return {item["content"] for item in response.json()["items"]}
+
+    assert matching("gte", 0) == {"score 0", "score 1", "score 11", "score 16"}
+    assert matching("lt", 5) == {"score 0"}
+    assert matching("gt", "5") == {"score 1", "score 11", "score 16"}
+    assert matching("gt", 0) == {"score 0", "score 1", "score 11", "score 16"}
+    # `ne` keeps every row whose value is not the number 3, numeric or not
+    assert matching("ne", 3) == {f"score {i}" for i in range(1, len(scores))}
+
+
+@pytest.mark.asyncio
 async def test_real_datetime_column_filtering(
     client: TestClient, sample_data: tuple[Workspace, Peer]
 ):
@@ -1645,7 +1762,7 @@ async def test_real_datetime_column_filtering(
     )
 
     # Test datetime filtering with various formats
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     one_minute_ago = now - timedelta(minutes=1)
 
     # Test ISO format
@@ -1660,7 +1777,7 @@ async def test_real_datetime_column_filtering(
     assert peer2_name in found_names
 
     # Test date-only format
-    today = datetime.now(timezone.utc).date().isoformat()
+    today = datetime.now(UTC).date().isoformat()
     response = client.post(
         f"/v3/workspaces/{test_workspace.name}/peers/list",
         json={"filters": {"created_at": {"gte": today}}},

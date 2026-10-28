@@ -5,6 +5,38 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](http://keepachangelog.com/)
 and this project adheres to [Semantic Versioning](http://semver.org/).
 
+## [2.7.0] - 2026-10-20
+
+### Added
+
+- `Conclusion.sourceMessageIds`: the messages the deriver cited as evidence for an explicit conclusion (Honcho v3.4.0+). Null for derived levels and for conclusions recorded before citations existed. Filter with `{ source_message_ids: { contains: '<message id>' } }` to find the conclusions that cite a message as evidence
+- `uid` on `Peer`, `Session` and the `Honcho` client (the workspace), plus on `PeerResponse`, `SessionResponse` and `WorkspaceResponse`: the immutable identifier the server assigns, next to the client-chosen `id`. Set from any API response that returns the object, and `undefined` before the first fetch or against servers that don't return it (#1394)
+
+## [2.6.0] - 2026-10-07
+
+### Added
+
+- `customInstructions` on workspace and session configuration (the shared fallback) and on the `summary`, `dream`, and `peerCard` sections, plus a new `dialectic` section (`DialecticConfig`) with its own `customInstructions`. Requires Honcho v3.3.0+ (#1303)
+
+## [2.5.1] - 2026-09-22
+
+### Added
+
+- `observer_id` and `observed_id` on `EvidenceObservation`, so evidence from workspace chat says which peer pair each conclusion belongs to. Requires Honcho v3.2.1+ (#1193)
+
+### Changed
+
+- `Conclusion.sourceIds` is `[]` rather than `null` for explicit conclusions when talking to Honcho v3.2.1+. The type still admits `null` for older servers (#1193)
+
+## [2.5.0] - 2026-09-15
+
+### Added
+
+- `honcho.getScope(id)` fetches an existing scope by ID and rejects with `NotFoundError` when it does not exist. Unlike `honcho.scope()`, it never creates the scope, so lookups cannot provision a recall boundary by accident (#1163)
+- `includeEvidence` on peer and workspace `chat()` / `chatStream()`. Opting in returns a `ChatResponse` carrying the answer plus the conclusions, messages, and tool calls the dialectic read; leaving it out returns the answer on its own. Streaming exposes `.evidence` once the stream is drained. Requires a Honcho server with the matching API support (Honcho v3.2.0+) (#1129)
+- `sourceIds` and `timesDerived` on `Conclusion`. `ConclusionsView.get(id)` / `getMany(ids)` / `derived(id)` and the workspace-level `honcho.conclusions.get` / `getMany` fetch a conclusion with attribution or walk the reasoning tree upward (source → derived). Requires a Honcho server with the matching API support (Honcho v3.2.0+) (#952)
+- SDK requests send `X-Honcho-Host: honcho-typescript/<version> (platform)` so CloudEvents can split harness vs direct SDK vs raw REST traffic. A caller-supplied `X-Honcho-Host` still wins. `VERSION` is exported next to `API_VERSION` (#1182)
+
 ## [2.4.0] - 2026-08-25
 
 ### Added

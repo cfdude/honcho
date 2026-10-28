@@ -38,10 +38,9 @@ from src.exceptions import HonchoException
 from src.models import Peer, Workspace
 from src.security import JWTParams, create_admin_jwt, create_jwt
 
-# Disable Langfuse for the whole suite before importing src.main: @conditional_observe
-# binds to settings.LANGFUSE_PUBLIC_KEY at import time, so blanking it here keeps mocked
-# test calls from emitting traces to a configured Langfuse backend. Tests that exercise
-# Langfuse patch settings.LANGFUSE_PUBLIC_KEY themselves.
+# Disable Langfuse for the whole suite before importing src.main so mocked test calls
+# never register the exporter against a configured Langfuse backend. Tests that
+# exercise Langfuse patch settings.LANGFUSE_PUBLIC_KEY themselves.
 settings.LANGFUSE_PUBLIC_KEY = None
 
 from src.main import app  # noqa: E402
@@ -83,18 +82,31 @@ _RUNTIME_MOCK_TEST_BLOCKLIST_PREFIXES = (
     "tests/live_llm/",
     # Pure llm unit tests should stay isolated from the broader app/runtime fixtures.
     "tests/llm/",
+    # Settings validation only; no database or provider calls.
+    "tests/test_config.py",
     # LLM transport tests mock providers directly and don't need database/runtime setup.
     "tests/utils/test_length_finish_reason.py",
     "tests/utils/test_clients.py",
     # Session-scope SQL shape — asserts on compiled statements, never executes one.
     "tests/crud/test_session_scope_clauses.py",
+    # Pure prompt-rendering tests — string assembly only, no DB needed.
+    "tests/deriver/test_prompts.py",
+    "tests/utils/test_custom_instructions_prompts.py",
     # Pure JWT scope tests — operate on src.security directly, no DB needed.
     "tests/test_security.py",
     "tests/test_generate_jwt_script.py",
+    # The mock provider is a standalone ASGI app with no database or LLM of its
+    # own; the runtime mocks would patch the very seams it exists to replace.
+    "tests/mock_provider/",
 )
 
 _LIVE_LLM_MARKER = "live_llm"
 _LIVE_LLM_SKIP_REASON = "live LLM tests are disabled; pass --live-llm to run them"
+
+# Property tests double the suite's wall time, so the pre-push hook skips them
+# and CI opts in. Their bugs stay covered by regression tests in tests/routes/.
+_FUZZ_TEST_PREFIX = "tests/property/"
+_FUZZ_SKIP_REASON = "property tests are disabled; pass --fuzz to run them"
 
 
 def _requires_runtime_mocks(nodeid: str) -> bool:
@@ -116,19 +128,27 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         default=False,
         help="Run opt-in live LLM integration tests that call provider APIs.",
     )
+    parser.addoption(
+        "--fuzz",
+        action="store_true",
+        default=False,
+        help="Run the property-based API fuzzers in tests/property/.",
+    )
 
 
 def pytest_collection_modifyitems(
     config: pytest.Config,
     items: list[pytest.Item],
 ) -> None:
-    if config.getoption("--live-llm"):
-        return
-
+    run_live = config.getoption("--live-llm")
+    run_fuzz = config.getoption("--fuzz")
     skip_live = pytest.mark.skip(reason=_LIVE_LLM_SKIP_REASON)
+    skip_fuzz = pytest.mark.skip(reason=_FUZZ_SKIP_REASON)
     for item in items:
-        if _LIVE_LLM_MARKER in item.keywords:
+        if not run_live and _LIVE_LLM_MARKER in item.keywords:
             item.add_marker(skip_live)
+        if not run_fuzz and item.nodeid.startswith(_FUZZ_TEST_PREFIX):
+            item.add_marker(skip_fuzz)
 
 
 _RUN_ID_ENV_VAR = "HONCHO_TEST_RUN_ID"
@@ -284,17 +304,23 @@ async def setup_test_database(db_url: URL):
     Returns:
         engine: SQLAlchemy engine
     """
-    engine = create_async_engine(str(db_url), echo=False)
+    engine = create_async_engine(db_url, echo=False)
     async with engine.connect() as conn:
         try:
-            logger.info("Attempting to create pgvector extension...")
+            logger.info(
+                "Attempting to create pgvector, pg_trgm and btree_gin extensions..."
+            )
             await conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
+            await conn.execute(text("CREATE EXTENSION IF NOT EXISTS pg_trgm"))
+            await conn.execute(text("CREATE EXTENSION IF NOT EXISTS btree_gin"))
             await conn.commit()
-            logger.info("pgvector extension created successfully.")
+            logger.info(
+                "pgvector, pg_trgm and btree_gin extensions created successfully."
+            )
         except ProgrammingError as e:
             logger.error(f"ProgrammingError: {e}")
             raise RuntimeError(
-                "Failed to create pgvector extension. Make sure it's installed on the PostgreSQL server."
+                "Failed to create pgvector/pg_trgm/btree_gin extensions. Make sure they're installed on the PostgreSQL server."
             ) from e
         except OperationalError as e:
             logger.error(f"OperationalError: {e}")
@@ -467,6 +493,13 @@ async def client(
 
     monkeypatch.setattr("src.main.validate_embedding_schema", _skip_validate)
 
+    # fastapi_pagination's lifespan wrapper regenerates and re-patches the whole
+    # OpenAPI schema on every startup once `app.openapi_schema` is cached (~80ms).
+    # Production starts once; this fixture starts the app per test, so after any
+    # test fetches /openapi.json every later client would pay it. Drop the cache
+    # so startup stays cheap; a test that needs the schema regenerates it.
+    app.openapi_schema = None
+
     with TestClient(app) as c:
         if settings.AUTH.USE_AUTH:
             # give the test client the admin JWT
@@ -562,6 +595,25 @@ def mock_langfuse():
                 logging.getLogger().removeHandler(handler)
 
 
+@pytest.fixture(autouse=True)
+def no_llm_retry_backoff(monkeypatch: pytest.MonkeyPatch):
+    """Retry LLM calls immediately instead of after the production backoff.
+
+    `honcho_llm_call` and the tool loop build `wait_exponential(min=4, max=10)`
+    at call time, so every test that exercises a retry otherwise sleeps at least
+    4s per attempt. Attempt counting and fallback selection are unaffected.
+    """
+    from tenacity import wait_none
+
+    from src.llm import api, tool_loop
+
+    def no_wait(**_kwargs: object) -> wait_none:
+        return wait_none()
+
+    monkeypatch.setattr(api, "wait_exponential", no_wait)
+    monkeypatch.setattr(tool_loop, "wait_exponential", no_wait)
+
+
 def _content_to_embedding(content: str) -> list[float]:
     """Generate a deterministic embedding from content hash.
 
@@ -599,6 +651,10 @@ def mock_openai_embeddings(request: pytest.FixtureRequest):
             "src.embedding_client.embedding_client.prepare_chunks"
         ) as mock_prepare_chunks,
         patch("src.embedding_client.embedding_client.batch_embed") as mock_batch_embed,
+        patch(
+            "src.embedding_client.embedding_client.truncate_to_token_limit",
+            side_effect=lambda text: text,  # pyright: ignore[reportUnknownLambdaType]
+        ) as mock_truncate,
     ):
         # Mock the embed method to return content-dependent embedding
         def embed_side_effect(content: str) -> list[float]:
@@ -637,6 +693,7 @@ def mock_openai_embeddings(request: pytest.FixtureRequest):
             "simple_batch_embed": mock_simple_batch_embed,
             "prepare_chunks": mock_prepare_chunks,
             "batch_embed": mock_batch_embed,
+            "truncate_to_token_limit": mock_truncate,
         }
 
 
@@ -948,7 +1005,10 @@ def mock_tracked_db(request: pytest.FixtureRequest):
         # the same per-test database session.
         del read_only
         async with session_factory() as session:
-            yield session
+            try:
+                yield session
+            finally:
+                await session.rollback()
 
     # Each module imports tracked_db by name, so patch every import site.
     # Use ExitStack (not a parenthesized `with`) to stay under CPython's
@@ -957,6 +1017,7 @@ def mock_tracked_db(request: pytest.FixtureRequest):
         "src.dependencies.tracked_db",
         "src.deriver.queue_manager.tracked_db",
         "src.deriver.consumer.tracked_db",
+        "src.deriver.deriver.tracked_db",
         "src.deriver.enqueue.tracked_db",
         "src.routers.peers.tracked_db",
         "src.routers.workspaces.tracked_db",
@@ -972,9 +1033,12 @@ def mock_tracked_db(request: pytest.FixtureRequest):
         "src.crud.document.tracked_db",
         "src.crud.message.tracked_db",
         "src.reconciler.sync_vectors.tracked_db",
+        "src.reconciler.backfill.tracked_db",
         "src.reconciler.embed_now.tracked_db",
         "src.dialectic.core.tracked_db",
         "src.dreamer.specialists.tracked_db",
+        "src.utils.memory_brief.tracked_db",
+        "src.dreamer.working_memory.tracked_db",
         "src.dreamer.surprisal.tracked_db",
         "src.deriver.scope_backfill.tracked_db",
     ]

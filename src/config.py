@@ -1,11 +1,11 @@
 import logging
 import math
 import os
+import tomllib
 from pathlib import Path
 from typing import Annotated, Any, ClassVar, Literal, cast, get_args
 from urllib.parse import urlparse
 
-import tomllib
 from dotenv import load_dotenv
 from pydantic import AliasChoices, BaseModel, Field, field_validator, model_validator
 from pydantic.fields import FieldInfo
@@ -77,6 +77,12 @@ PROVIDER_TIMEOUT_ERROR_TEXT = (
     "provider_params.timeout must be a positive number of seconds"
 )
 
+# Values of provider_params.thinking_tool_choice_conflict: what a backend does
+# when extended thinking meets a forced tool choice, which Anthropic rejects.
+THINKING_TOOL_CHOICE_CONFLICT_MODES = frozenset(
+    {"throw", "override_thinking", "override_tool"}
+)
+
 
 def coerce_provider_timeout(value: Any) -> float:
     """Coerce a `provider_params.timeout` value to positive, finite seconds.
@@ -131,8 +137,15 @@ class ModelOverrideSettings(BaseModel):
 
     @field_validator("provider_params")
     @classmethod
-    def _validate_provider_timeout(cls, v: dict[str, Any]) -> dict[str, Any]:
-        """Reject bad `timeout` values at config load; normalize good ones to float."""
+    def _validate_provider_params(cls, v: dict[str, Any]) -> dict[str, Any]:
+        """Reject bad `timeout` and `thinking_tool_choice_conflict` values at
+        config load; normalize a good timeout to float."""
+        mode = v.get("thinking_tool_choice_conflict")
+        if mode is not None and mode not in THINKING_TOOL_CHOICE_CONFLICT_MODES:
+            raise ValueError(
+                "provider_params.thinking_tool_choice_conflict must be one of "
+                + f"{sorted(THINKING_TOOL_CHOICE_CONFLICT_MODES)}, got {mode!r}"
+            )
         if "timeout" not in v:
             return v
         return {**v, "timeout": coerce_provider_timeout(v["timeout"])}
@@ -746,6 +759,9 @@ class DBSettings(HonchoSettings):
     # deriver backs off and retries on a later poll).
     CONNECT_TIMEOUT_SECONDS: Annotated[int, Field(default=2, gt=0, le=60)] = 2
 
+    # Seconds a migrator waits for another migrator's advisory lock before failing
+    MIGRATION_LOCK_WAIT_SECONDS: Annotated[int, Field(default=300, gt=0, le=3600)] = 300
+
 
 class AuthSettings(HonchoSettings):
     model_config = SettingsConfigDict(env_prefix="AUTH_", extra="ignore")  # pyright: ignore
@@ -972,6 +988,10 @@ class DeriverSettings(HonchoSettings):
     # When enabled, bypasses the batch token threshold and processes work immediately
     FLUSH_ENABLED: bool = False
 
+    BACKLOG_METRICS_POLL_INTERVAL_SECONDS: Annotated[int, Field(default=30, ge=1)] = 30
+
+    SCHEDULER: Literal["api", "deriver"] = "deriver"
+
     @model_validator(mode="before")
     @classmethod
     def _merge_model_config_defaults(cls, data: Any) -> Any:
@@ -1095,8 +1115,19 @@ class DialecticSettings(HonchoSettings):
     MAX_OUTPUT_TOKENS: Annotated[int, Field(default=8192, gt=0, le=100_000)] = 8192
     MAX_INPUT_TOKENS: Annotated[int, Field(default=100_000, gt=0, le=200_000)] = 100_000
 
-    # Token limit for get_recent_history tool within the agent
-    HISTORY_TOKEN_LIMIT: Annotated[int, Field(default=8192, gt=0, le=100_000)] = 8192
+    # Extra tool rounds workspace chat gets on top of its level's limit. A
+    # workspace query fans out over peers where a pair query reads one
+    # representation, so it needs room to route and then recall. Not applied at
+    # "minimal", whose single round is the point of the level.
+    WORKSPACE_EXTRA_TOOL_ITERATIONS: Annotated[int, Field(default=3, ge=0, le=20)] = 3
+
+    # Show a tool-call budget line after each round, at levels allowing three
+    # or more tool iterations.
+    BUDGET_ENABLED: bool = False
+    # Add the memory-layout section to the system prompt and, for unrestricted
+    # pair queries, conclusion counts and the dreamer's `map` notes (when
+    # DREAM_NOTES_MODE=on) to the first message.
+    BRIEF_ENABLED: bool = False
 
     # Session history injection: max tokens of recent messages to include when session_id is specified.
     # Set to 0 to disable automatic session history injection.
@@ -1213,8 +1244,48 @@ class SummarySettings(HonchoSettings):
             )
         return data  # pyright: ignore[reportUnknownVariableType]
 
-    MAX_TOKENS_SHORT: Annotated[int, Field(default=1000, gt=0, le=10_000)] = 1000
-    MAX_TOKENS_LONG: Annotated[int, Field(default=4000, gt=0, le=20_000)] = 4000
+    # Per-call output caps. The prompt asks for a fraction of these as a soft
+    # target (SUMMARY_TARGET_RATIO in src/utils/summarizer.py), leaving the rest
+    # as headroom so a summary can finish instead of truncating.
+    MAX_TOKENS_SHORT: Annotated[int, Field(default=1500, gt=0, le=10_000)] = 1500
+    MAX_TOKENS_LONG: Annotated[int, Field(default=6000, gt=0, le=20_000)] = 6000
+
+    # Input budget for one summary call: prompt, previous summary and messages.
+    # The message window is chosen by count, so long messages can outgrow the
+    # model's context window; the oldest messages in the window are dropped to
+    # fit. A fixed budget, like DIALECTIC_MAX_INPUT_TOKENS, kept well under the
+    # context windows of the configured model and its fallback.
+    MAX_INPUT_TOKENS: Annotated[int, Field(default=100_000, gt=0, le=200_000)] = 100_000
+
+    @model_validator(mode="after")
+    def _validate_caps_within_model_ceiling(self) -> "SummarySettings":
+        """Keep MODEL_CONFIG.max_output_tokens a ceiling over both summary caps."""
+        ceiling = self.MODEL_CONFIG.max_output_tokens
+        if ceiling is None:
+            return self
+        for name in ("MAX_TOKENS_SHORT", "MAX_TOKENS_LONG"):
+            if getattr(self, name) > ceiling:
+                raise ValueError(
+                    f"summary.{name} must not exceed "
+                    + "summary.MODEL_CONFIG.max_output_tokens"
+                )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_input_budget_fits_previous_summary(self) -> "SummarySettings":
+        """Leave room for messages after the largest possible previous summary.
+
+        A previous summary is sent in full and can be as long as its cap, which
+        may be either one. Requiring twice the larger cap leaves at least that
+        much again for the prompt and messages.
+        """
+        minimum_budget = 2 * max(self.MAX_TOKENS_SHORT, self.MAX_TOKENS_LONG)
+        if minimum_budget > self.MAX_INPUT_TOKENS:
+            raise ValueError(
+                "summary.MAX_INPUT_TOKENS must be at least twice the larger of "
+                + "summary.MAX_TOKENS_SHORT and summary.MAX_TOKENS_LONG"
+            )
+        return self
 
 
 class WebhookSettings(HonchoSettings):
@@ -1300,6 +1371,8 @@ class CacheSettings(HonchoSettings):
     # for Redis Cluster). A standalone client cannot follow the MOVED redirects
     # such deployments return for keys hashed to another shard.
     CLUSTER: bool = False
+    CONNECT_TIMEOUT_SECONDS: Annotated[float, Field(default=5.0, gt=0, le=60)] = 5.0
+    CONNECT_RETRIES: Annotated[int, Field(default=3, ge=0, le=10)] = 3
     NAMESPACE: str | None = None
     DEFAULT_TTL_SECONDS: Annotated[int, Field(default=300, ge=1, le=86_400)] = (
         300  # how long to keep items in cache
@@ -1308,6 +1381,16 @@ class CacheSettings(HonchoSettings):
     DEFAULT_LOCK_TTL_SECONDS: Annotated[int, Field(default=5, ge=1, le=86_400)] = (
         5  # how long to hold a lock on a resource when fetching DB after cache miss
     )
+
+    # Serve offset-paginated list requests (`?page=N`) with a keyset seek from
+    # a cached position where possible; see src/utils/pagination.py.
+    PAGINATION_OFFSET_SHIM: bool = True
+    # ai: long enough to span a pause in a client's walk, short enough that abandoned walks expire
+    PAGINATION_POSITION_TTL_SECONDS: Annotated[
+        int, Field(default=600, ge=1, le=86_400)
+    ] = 600
+    # How stale `total` may be on pages after the first.
+    PAGINATION_COUNT_TTL_SECONDS: Annotated[int, Field(default=60, ge=1, le=3_600)] = 60
 
     # Polling interval while waiting for another worker's fetch lock. cashews
     # defaults to 0, which busy-spins the event loop for the whole wait.
@@ -1351,14 +1434,39 @@ class DreamSettings(HonchoSettings):
     DOCUMENT_THRESHOLD: Annotated[int, Field(default=50, gt=0, le=1000)] = 50
     IDLE_TIMEOUT_MINUTES: Annotated[int, Field(default=60, gt=0, le=1440)] = 60
     MIN_HOURS_BETWEEN_DREAMS: Annotated[int, Field(default=8, gt=0, le=72)] = 8
+    DUE_POLL_INTERVAL_SECONDS: Annotated[int, Field(default=300, ge=1)] = 300
+    MAX_ENQUEUED_PER_POLL: Annotated[int, Field(default=100, gt=0, le=10_000)] = 100
     ENABLED_TYPES: list[str] = ["omni"]
 
-    # Agent iteration limit - increased for extended reasoning workflow
+    # Card-refresh dreams only; capped further by the specialist's own ceiling.
+    # Deduction and induction use the per-specialist limits below.
     MAX_TOOL_ITERATIONS: Annotated[int, Field(default=20, gt=0, le=50)] = 20
-
-    # Token limit for get_recent_history tool within the agent
-    HISTORY_TOKEN_LIMIT: Annotated[int, Field(default=16_384, gt=0, le=200_000)] = (
-        16_384
+    DEDUCTION_MAX_TOOL_ITERATIONS: Annotated[int, Field(default=12, ge=1, le=50)] = 12
+    INDUCTION_MAX_TOOL_ITERATIONS: Annotated[int, Field(default=10, ge=1, le=50)] = 10
+    # Deduction and induction start with a description of how memory is
+    # organized and conclusion counts by level.
+    BRIEF_ENABLED: bool = False
+    # Cap on the since-last-dream work list in the brief. A larger backlog is
+    # worked through over consecutive dreams.
+    BRIEF_MAX_NEW_CONCLUSIONS: Annotated[int, Field(default=50, ge=1, le=500)] = 50
+    # Token cap on the same list: conclusions created through the API can be
+    # long. At least one is always shown, so one huge conclusion can't stall it.
+    BRIEF_MAX_NEW_CONCLUSION_TOKENS: Annotated[
+        int, Field(default=8000, ge=500, le=100_000)
+    ] = 8000
+    # Deduction and induction see a tool-call budget line, the last iterations
+    # are reserved for writes, and the final call at the limit can still write.
+    BUDGET_ENABLED: bool = False
+    # Working notes carried between dreams: "off", "shadow" (written but never
+    # loaded, so a sample can be judged) or "on".
+    NOTES_MODE: Literal["off", "shadow", "on"] = "off"
+    # Split evenly between deduction's and induction's own entries.
+    NOTES_MAX_TOKENS: Annotated[int, Field(default=3000, ge=100, le=20_000)] = 3000
+    # Iterations reserved for writes at the end of a pass. Unset means 15% of
+    # the specialist's limit, rounded, with a minimum of one, and at most one
+    # less than the limit.
+    WRITE_WINDOW_ITERATIONS: Annotated[int | None, Field(default=None, ge=1, le=50)] = (
+        None
     )
 
     @staticmethod
@@ -1425,12 +1533,14 @@ class DreamSettings(HonchoSettings):
 
 
 class VectorStoreSettings(HonchoSettings):
-    """Settings for vector store (pgvector, Turbopuffer, or LanceDB)."""
+    """Settings for vector store (pgvector, Turbopuffer, LanceDB, Qdrant, or ChromaDB)."""
 
     model_config = SettingsConfigDict(env_prefix="VECTOR_STORE_", extra="ignore")  # pyright: ignore
 
     # Vector store type to use
-    TYPE: Literal["pgvector", "turbopuffer", "lancedb"] = "pgvector"
+    TYPE: Literal["pgvector", "turbopuffer", "lancedb", "qdrant", "chromadb"] = (
+        "pgvector"
+    )
 
     MIGRATED: bool = False
 
@@ -1456,15 +1566,63 @@ class VectorStoreSettings(HonchoSettings):
     # LanceDB-specific settings (local embedded mode)
     LANCEDB_PATH: str = "./lancedb_data"
 
+    # Qdrant-specific settings
+    QDRANT_URL: str = "http://localhost:6333"
+    QDRANT_API_KEY: str | None = None
+    QDRANT_PREFER_GRPC: bool = False
+    QDRANT_GRPC_PORT: int = 6334
+    QDRANT_HTTPS: bool | None = None
+    QDRANT_PREFIX: str | None = None
+    QDRANT_TIMEOUT: int | None = None
+
+    # ChromaDB-specific settings
+    # CHROMA_CLIENT_MODE selects the deployment shape:
+    # - "http": self-hosted Chroma server at CHROMA_HOST:CHROMA_PORT
+    # - "cloud": Chroma Cloud (requires CHROMA_API_KEY)
+    # Embedded persistence is unsafe across Honcho's API/worker processes.
+    CHROMA_CLIENT_MODE: Literal["http", "cloud"] = "http"
+    CHROMA_HOST: str = "localhost"
+    CHROMA_PORT: Annotated[int, Field(default=8000, gt=0)] = 8000
+    CHROMA_SSL: bool = False
+    CHROMA_API_KEY: str | None = None
+    # Tenant/database are optional for cloud mode (resolved from the API key
+    # when omitted); ignored in http mode.
+    CHROMA_TENANT: str | None = None
+    CHROMA_DATABASE: str | None = None
+
     RECONCILIATION_INTERVAL_SECONDS: Annotated[int, Field(default=300, gt=0)] = (
         300  # 5 minutes
     )
+
+    @field_validator("CHROMA_CLIENT_MODE", mode="before")
+    @classmethod
+    def _reject_embedded_chroma(cls, value: Any) -> Any:
+        if value == "persistent":
+            raise ValueError(
+                "ChromaDB persistent mode is unsafe across Honcho's multiple "
+                + "processes. Use VECTOR_STORE_CHROMA_CLIENT_MODE=http with a "
+                + "Chroma server, or cloud."
+            )
+        return value
 
     @model_validator(mode="after")
     def _require_api_key_for_turbopuffer(self) -> "VectorStoreSettings":
         if self.TYPE == "turbopuffer" and not self.TURBOPUFFER_API_KEY:
             raise ValueError(
                 "VECTOR_STORE_TURBOPUFFER_API_KEY must be set when TYPE is 'turbopuffer'"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _require_api_key_for_chroma_cloud(self) -> "VectorStoreSettings":
+        if (
+            self.TYPE == "chromadb"
+            and self.CHROMA_CLIENT_MODE == "cloud"
+            and not self.CHROMA_API_KEY
+        ):
+            raise ValueError(
+                "VECTOR_STORE_CHROMA_API_KEY must be set when TYPE is 'chromadb'"
+                + " and CHROMA_CLIENT_MODE is 'cloud'"
             )
         return self
 
@@ -1499,29 +1657,11 @@ class AppSettings(HonchoSettings):
     EMBED_MESSAGES: bool = True
     LANGFUSE_HOST: str | None = None
     LANGFUSE_PUBLIC_KEY: str | None = None
-    # How Langfuse traces are produced:
-    #   "exporter" (default) — Langfuse is a projection over the captured
-    #     CapturedLLMCall stream (LangfuseExporter), the same source of truth as
-    #     the CloudEvents trace stream.
-    #   "inline" — legacy live instrumentation (@observe + propagate_attributes
-    #     spans during execution). Kept one release for side-by-side validation.
-    LANGFUSE_EXPORTER_MODE: Literal["inline", "exporter"] = "exporter"
-
-    @property
-    def langfuse_inline_enabled(self) -> bool:
-        """True when the legacy inline Langfuse instrumentation is active
-        (keys configured + ``LANGFUSE_EXPORTER_MODE == "inline"``)."""
-        return (
-            bool(self.LANGFUSE_PUBLIC_KEY) and self.LANGFUSE_EXPORTER_MODE == "inline"
-        )
 
     @property
     def langfuse_exporter_enabled(self) -> bool:
-        """True when the Langfuse exporter (a projection over the captured call
-        stream) is active (keys configured + ``LANGFUSE_EXPORTER_MODE == "exporter"``)."""
-        return (
-            bool(self.LANGFUSE_PUBLIC_KEY) and self.LANGFUSE_EXPORTER_MODE == "exporter"
-        )
+        """True when Langfuse keys are configured."""
+        return bool(self.LANGFUSE_PUBLIC_KEY)
 
     # Origins allowed by the FastAPI CORSMiddleware
     CORS_ORIGINS: list[str] = [
@@ -1596,6 +1736,35 @@ class AppSettings(HonchoSettings):
         if "NAMESPACE" not in self.METRICS.model_fields_set:
             self.METRICS.NAMESPACE = self.NAMESPACE
 
+        return self
+
+    @model_validator(mode="after")
+    def warn_unused_provider_keys(self) -> "AppSettings":
+        """Flag credentials whose transport is absent from configured workloads."""
+        model_configs = [
+            self.DERIVER.MODEL_CONFIG,
+            self.SUMMARY.MODEL_CONFIG,
+            self.DREAM.DEDUCTION_MODEL_CONFIG,
+            self.DREAM.INDUCTION_MODEL_CONFIG,
+            *(level.MODEL_CONFIG for level in self.DIALECTIC.LEVELS.values()),
+        ]
+        transports = {config.transport for config in model_configs}
+        transports.update(
+            config.fallback.transport
+            for config in model_configs
+            if config.fallback is not None
+        )
+        transports.add(self.EMBEDDING.MODEL_CONFIG.transport)
+
+        for transport in get_args(ModelTransport):
+            key_name = f"{transport.upper()}_API_KEY"
+            if getattr(self.LLM, key_name) and transport not in transports:
+                logger.warning(
+                    "LLM_%s is set but no configured workload uses transport=%s. "
+                    + "Remove it from your configuration if it is no longer needed.",
+                    key_name,
+                    transport,
+                )
         return self
 
 

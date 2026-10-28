@@ -1,6 +1,6 @@
 import asyncio
 import contextlib
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from logging import getLogger
 
 import sentry_sdk
@@ -245,6 +245,53 @@ class DreamScheduler:
             self.pending_dreams.clear()
 
 
+# Recorded in the scheduler's `dream` metadata: work-list conclusions the last
+# dream left for the next one. The API scheduler treats a pair with a backlog as
+# due even when no new conclusions have arrived since.
+WORK_LIST_BACKLOG_KEY = "work_list_backlog"
+
+
+async def schedule_backlog_dream(
+    workspace_name: str, *, observer: str, observed: str
+) -> None:
+    """Schedule the next dream for a pair whose work list is still behind.
+
+    The timer scheduler only checks a pair when new conclusions are saved, so a
+    backlog left after ingestion stops would wait for the next message. The
+    timer waits out `MIN_HOURS_BETWEEN_DREAMS`, the same gate a threshold dream
+    passes. The API scheduler needs no timer: it reads the recorded backlog.
+
+    Like a threshold dream, the follow-up needs a session to resolve the dream
+    configuration from: when the pair's newest explicit conclusion has none
+    (created through the API without a session), both schedulers skip it, and
+    the backlog waits for a manually scheduled dream.
+    """
+    if settings.DERIVER.SCHEDULER == "api":
+        return
+    dream_scheduler = get_dream_scheduler()
+    if dream_scheduler is None:
+        return
+    work_unit_key = construct_work_unit_key(
+        workspace_name,
+        {
+            "task_type": "dream",
+            "observer": observer,
+            "observed": observed,
+            "dream_type": DreamType.OMNI.value,
+        },
+    )
+    await dream_scheduler.schedule_dream(
+        work_unit_key,
+        workspace_name,
+        settings.DREAM.MIN_HOURS_BETWEEN_DREAMS * 60,
+        DreamType.OMNI,
+        observer=observer,
+        observed=observed,
+        trigger_reason="work_list_backlog",
+        delay_reason="min_hours_gate",
+    )
+
+
 async def check_and_schedule_dream(
     db: AsyncSession,
     collection: models.Collection,
@@ -270,7 +317,7 @@ async def check_and_schedule_dream(
     Returns:
         True if a dream timer was scheduled, False otherwise
     """
-    if not settings.DREAM.ENABLED:
+    if not settings.DREAM.ENABLED or settings.DERIVER.SCHEDULER == "api":
         return False
 
     dream_metadata = collection.internal_metadata.get("dream", {})
@@ -315,7 +362,7 @@ async def check_and_schedule_dream(
             try:
                 last_dream_time = datetime.fromisoformat(last_dream_at)
                 hours_since_last_dream = (
-                    datetime.now(timezone.utc) - last_dream_time
+                    datetime.now(UTC) - last_dream_time
                 ).total_seconds() / 3600
 
                 if hours_since_last_dream < settings.DREAM.MIN_HOURS_BETWEEN_DREAMS:

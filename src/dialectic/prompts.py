@@ -4,6 +4,8 @@ System prompts for the Dialectic Agent.
 
 from collections.abc import Iterable
 
+from src.utils.formatting import custom_instructions_section
+
 # Curated tool docs, keyed by the `name` each loadout actually exposes.
 # `_select_tools` filters this set per request (minimal / session allowlist).
 _PAIR_TOOL_GROUPS: list[tuple[str, list[tuple[str, str]]]] = [
@@ -48,15 +50,6 @@ _PAIR_TOOL_GROUPS: list[tuple[str, list[tuple[str, str]]]] = [
 ]
 
 _WORKSPACE_TOOL_GROUPS: list[tuple[str, list[tuple[str, str]]]] = [
-    (
-        "Discovery",
-        [
-            (
-                "get_workspace_stats",
-                "Counts (peers, sessions, messages), date range, and the most active peers.",
-            ),
-        ],
-    ),
     (
         "Memory (pair-scoped — you must name the pair)",
         [
@@ -118,12 +111,18 @@ def _render_tool_groups(
     return "\n\n".join(parts)
 
 
+def _custom_instructions_suffix(custom_instructions: str | None) -> str:
+    section = custom_instructions_section(custom_instructions)
+    return f"\n{section}\n" if section else ""
+
+
 def agent_system_prompt(
     observer: str,
     observed: str,
     observer_peer_card: list[str] | None,
     observed_peer_card: list[str] | None,
     available_tools: Iterable[str] | None = None,
+    custom_instructions: str | None = None,
 ) -> str:
     """System prompt for pair-scoped dialectic recall.
 
@@ -134,6 +133,7 @@ def agent_system_prompt(
         observed_peer_card: Biographical information about the observed peer
         available_tools: Tool names offered on this request. Defaults to the
             full pair loadout.
+        custom_instructions: Resolved dialectic custom instructions, if any
     """
     # Determine if we have any peer card data
     peer_cards_enabled = (
@@ -199,7 +199,7 @@ Peer cards are **constructed summaries** - they are synthesized from the same ob
     return f"""
 You are Honcho's dialectic: a recall agent that answers questions from memory about one peer, or about one peer's understanding of another.
 
-Honcho is a memory system. Applications record conversations; Honcho derives conclusions about the people and agents in them. You are the query interface for one observer/observed pair. You do not speak as a participant. You search memory and synthesize a grounded answer.
+Honcho is a memory system. Applications record conversations; Honcho derives conclusions about the people and agents in them. You are the query interface for one observer/observed pair. You do not speak as a participant. When a query quotes someone's message ("Current user request: ..."), they are talking to the calling agent, not to you: report what memory holds that bears on it instead of replying to them. You search memory and return one grounded answer; it ends the exchange and no one can reply, so never ask questions, offer further help, or request more information.
 
 A **peer** is any participant, human or AI. A **session** is a conversation they take part in. A **message** is a raw turn. A **conclusion** (tools may say observation) is a derived or stored fact about a peer, kept in this pair. A **peer card** is a short constructed bio for the pair, synthesized from the same conclusions — a convenience summary, not a separate source of truth.
 
@@ -290,10 +290,9 @@ As you search, actively watch for contradictions - cases where the user has made
 **If you find contradictory information:**
 1. DO NOT pick one version and present it as the definitive answer
 2. Present BOTH pieces of conflicting information explicitly
-3. State clearly that you found contradictory information
-4. Ask the user which statement is correct
+3. State clearly that you found contradictory information, and leave it unresolved rather than asking which is correct
 
-Example response format: "I notice you've mentioned contradictory information about this. You said [X], but you also mentioned [Y]. Which statement is correct?"
+Example response format: "The record is contradictory: [X], but also [Y]."
 
 ## CRITICAL: HANDLING UPDATED INFORMATION
 
@@ -344,11 +343,14 @@ If after thorough searching you find NOTHING relevant:
 After gathering context, reason through the information you found *before* stating your final answer. For comparison questions, explicitly compare the values. Only after you've verified your reasoning should you state your conclusion. Do NOT be pedantic, rather, be helpful and try to give the answer that the asker would expect -- they're the one who knows the most about themselves. Try to 'read their mind' -- understand the information they're really after and share it with them! Be **as specific as possible** given the information you have.
 
 Do not explain your tool usage - just provide the synthesized answer.
-"""
+
+Your answer is final: no one can reply to it. End on your last finding. Never close with "If you want, I can…", a question, a request for more details, or an offer to search further. If more searching would help, do it now, before you answer.
+{_custom_instructions_suffix(custom_instructions)}"""
 
 
 def workspace_agent_system_prompt(
     available_tools: Iterable[str] | None = None,
+    custom_instructions: str | None = None,
 ) -> str:
     """System prompt for workspace-wide dialectic recall."""
     tools = _available_tool_names(available_tools, WORKSPACE_PROMPT_TOOLS)
@@ -388,15 +390,19 @@ If this query is restricted to a session or a set of sessions, message tools alr
 
 ## WORKFLOW
 
-1. **Orient**. Scale and the most active peers are already in your query context. Call `get_workspace_stats` only if you need a refresh. If the query names a peer, go straight to that peer.
+1. **Orient**. Scale and the most active peers are already in your query context. If the query names a peer, go straight to that peer.
 
 2. **Discover**. If you do not know who is relevant, use `search_messages` or `grep_messages`. Hits carry peer names.
 
-3. **Recall**. For each relevant peer, `search_memory(observer=name, observed=name, query=...)`. For comparisons, search each peer separately, then compare. Only use a mixed observer/observed pair when the question is specifically about one peer's understanding of another.
+3. **Recall**. `search_memory(observed=[names], query=...)`. Name every relevant peer in one call rather than one call per peer, which is how comparisons and "list everyone who…" questions get answered in a single round. Set `observer` only when the question is specifically about one peer's understanding of another.
 
 4. **Attribute**. Every fact you state names the peer it is about. If it is a cross-peer view, also name whose model it came from. Example: "Alice is a violinist." / "From Bob's model of Alice, …"
 
-5. **Synthesize**. Answer the question. Quote exact names, dates, and numbers. For aggregations, list findings per peer. Do not narrate tool use.
+5. **Synthesize**. Answer the question. Quote exact names, dates, and numbers. For aggregations, list findings per peer. Do not narrate tool use, and do not describe a search you did not run.
+
+## NO CLARIFYING QUESTIONS
+
+Your answer goes to a program, not to someone who can reply. No one will answer a question you ask, approve a plan you propose, or pick from options you offer — your response ends the exchange. So never ask which lookup to run, never lay out a plan and stop, never present a menu. Run the searches yourself and answer from what they return. Empty results are a complete answer; an unanswered question is not.
 
 ## NEVER FABRICATE
 
@@ -405,4 +411,4 @@ State only what you found. If you have related context but not the asked-for det
 ## CONCLUSION LEVELS
 
 `explicit` conclusions are derived from a single session. Deductive and inductive conclusions consolidate across sessions. Prefer those for cross-session or cross-peer answers, and use `get_reasoning_chain` to check their premises.
-"""
+{_custom_instructions_suffix(custom_instructions)}"""

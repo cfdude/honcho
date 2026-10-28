@@ -1,13 +1,18 @@
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { ToolContext } from "../types.js";
-import { textResult, errorResult, workspaceIdSchema } from "../types.js";
+import { textResult, workspaceIdSchema, failedResult } from "../types.js";
 
 export function register(server: McpServer, ctx: ToolContext) {
   // ── schedule_dream ──────────────────────────────────────────────────
   server.registerTool(
     "schedule_dream",
     {
+      annotations: {
+        title: "Schedule Dream",
+        readOnlyHint: false,
+        destructiveHint: true,
+      },
       description: [
         "Schedule a dream — a background memory-consolidation task for a peer.",
         "Dreams consolidate observations into higher-level insights and update peer cards.",
@@ -37,9 +42,7 @@ export function register(server: McpServer, ctx: ToolContext) {
         });
         return textResult("Dream scheduled successfully");
       } catch (e) {
-        return errorResult(
-          `Failed to schedule dream: ${e instanceof Error ? e.message : String(e)}`,
-        );
+        return failedResult(ctx, `Failed to schedule dream`, e);
       }
     },
   );
@@ -48,6 +51,10 @@ export function register(server: McpServer, ctx: ToolContext) {
   server.registerTool(
     "get_queue_status",
     {
+      annotations: {
+        title: "Get Queue Status",
+        readOnlyHint: true,
+      },
       description: [
         "Get the current processing queue status for background tasks (message derivation, dreams).",
         "Use this to check if Honcho is still processing messages before querying for insights.",
@@ -62,9 +69,7 @@ export function register(server: McpServer, ctx: ToolContext) {
         const status = await ctx.clientFor(workspace_id).queueStatus();
         return textResult(status);
       } catch (e) {
-        return errorResult(
-          `Failed to get queue status: ${e instanceof Error ? e.message : String(e)}`,
-        );
+        return failedResult(ctx, `Failed to get queue status`, e);
       }
     },
   );

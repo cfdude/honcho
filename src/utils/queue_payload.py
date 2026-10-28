@@ -1,9 +1,17 @@
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, model_validator
 
 from src.schemas import DreamType, ReconcilerType, ResolvedConfiguration
+
+# Queue mechanics, not task data: the deriver stores a per-work-unit transient
+# failure count under this key so a retry budget survives work-unit reclaim.
+# Every payload model below forbids extras, so anything that reads a raw
+# QueueItem.payload must strip this key before validating. Lives here rather
+# than in the deriver because both the writer (queue_manager) and the stripper
+# (consumer) need it, and queue_manager imports consumer.
+RETRY_ATTEMPTS_PAYLOAD_KEY = "_retry_attempts"
 
 
 class BasePayload(BaseModel):
@@ -106,6 +114,15 @@ class ReconcilerPayload(BasePayload):
 
     task_type: Literal["reconciler"] = "reconciler"
     reconciler_type: ReconcilerType
+    backfill_name: str | None = None
+
+    @model_validator(mode="after")
+    def _backfill_name_matches_type(self) -> "ReconcilerPayload":
+        if (self.reconciler_type == ReconcilerType.BACKFILL) != (
+            self.backfill_name is not None
+        ):
+            raise ValueError("backfill_name is required exactly for backfill tasks")
+        return self
 
 
 def create_webhook_payload(

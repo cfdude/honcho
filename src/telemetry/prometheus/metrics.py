@@ -51,6 +51,12 @@ class TokenTypes(Enum):
     OUTPUT = "output"
 
 
+class PaginationShimOutcomes(Enum):
+    FIRST = "first"
+    HIT = "hit"
+    MISS = "miss"
+
+
 class DeriverTaskTypes(Enum):
     INGESTION = "ingestion"
     SUMMARY = "summary"
@@ -120,6 +126,12 @@ embed_now_tasks_shed_counter = NamespacedCounter(
     ["namespace"],
 )
 
+pagination_offset_shim_counter = NamespacedCounter(
+    "pagination_offset_shim",
+    "Offset-paginated list requests served by the offset shim, by outcome: first (page 1, always a fresh query), hit (sought from a stored position) or miss (no stored position, so an OFFSET query)",
+    ["namespace", "outcome"],
+)
+
 embed_now_tasks_in_flight_gauge = NamespacedGauge(
     "embed_now_tasks_in_flight",
     "Immediate-embed background tasks currently in flight for this process",
@@ -142,6 +154,14 @@ deriver_tokens_processed_counter = NamespacedCounter(
     "deriver_tokens_processed",
     "Total tokens processed by the deriver",
     ["namespace", "task_type", "token_type", "component"],
+)
+
+SUMMARY_REJECTION_DEGENERATE = "degenerate_repetition"
+
+summary_rejections_counter = NamespacedCounter(
+    "summary_rejections",
+    "Total summaries rejected by validation before persistence",
+    ["namespace", "summary_type", "reason"],
 )
 
 dialectic_tokens_processed_counter = NamespacedCounter(
@@ -196,6 +216,77 @@ message_embeddings_pending_gauge = NamespacedGauge(
     "MessageEmbedding rows awaiting embedding (sync_state='pending'). "
     + "Service-wide DB count, reported independently by every replica — "
     + "aggregate with max() or avg(), never sum()",
+    ["namespace"],
+)
+
+backfill_pending_gauge = NamespacedGauge(
+    "backfill_pending",
+    "Rows still matching a backfill's pending predicate, by backfill name. "
+    + "Service-wide DB count, reported independently by every replica running "
+    + "the reconciler scheduler — aggregate with max() or avg(), never sum()",
+    ["namespace", "task"],
+)
+
+message_embeddings_pending_due_gauge = NamespacedGauge(
+    "message_embeddings_pending_due",
+    "Pending MessageEmbedding rows past their retry backoff, so a sync attempt "
+    + "is due. Service-wide DB count, reported independently by every API "
+    + "replica — aggregate with max() or avg(), never sum()",
+    ["namespace"],
+)
+
+deriver_outstanding_work_seconds_gauge = NamespacedGauge(
+    "deriver_outstanding_work_seconds",
+    "Seconds of outstanding deriver work, 0 when a deriver has nothing to do. "
+    + "Service-wide DB value, reported independently by every API replica — "
+    + "aggregate with max(), never sum()",
+    ["namespace"],
+)
+
+deriver_queue_work_units_eligible_gauge = NamespacedGauge(
+    "deriver_queue_work_units_eligible",
+    "Work units a deriver could claim right now, ignoring stale claims. "
+    + "Service-wide DB count, reported independently by every API replica — "
+    + "aggregate with max() or avg(), never sum()",
+    ["namespace"],
+)
+
+deriver_queue_work_units_claimed_gauge = NamespacedGauge(
+    "deriver_queue_work_units_claimed",
+    "Work units held by a claim refreshed inside the stale timeout, so work is "
+    + "in flight. Service-wide DB count, reported independently by every API "
+    + "replica — aggregate with max() or avg(), never sum()",
+    ["namespace"],
+)
+
+deriver_queue_items_pending_gauge = NamespacedGauge(
+    "deriver_queue_items_pending",
+    "Unprocessed queue rows, whether or not they are claimable yet. "
+    + "Service-wide DB count, reported independently by every API replica — "
+    + "aggregate with max() or avg(), never sum()",
+    ["namespace"],
+)
+
+deriver_queue_oldest_pending_age_seconds_gauge = NamespacedGauge(
+    "deriver_queue_oldest_pending_age_seconds",
+    "Age of the oldest unprocessed queue row, 0 when the queue is empty. "
+    + "Service-wide DB value, reported independently by every API replica — "
+    + "aggregate with max() or avg(), never sum()",
+    ["namespace"],
+)
+
+dreams_due_gauge = NamespacedGauge(
+    "dreams_due",
+    "Collections whose next dream is due and would actually run. "
+    + "Service-wide DB count, reported independently by every API replica — "
+    + "aggregate with max() or avg(), never sum()",
+    ["namespace"],
+)
+
+deriver_metrics_last_success_timestamp_gauge = NamespacedGauge(
+    "deriver_metrics_last_success_timestamp_seconds",
+    "Unix time of the last successful deriver-metrics refresh in this replica. "
+    + "Alert on time() minus this value; a frozen value means the poller stopped",
     ["namespace"],
 )
 
@@ -287,6 +378,12 @@ class PrometheusMetrics:
         except Exception as e:
             self._handle_metric_error("record_embed_now_task_shed", e)
 
+    def record_pagination_offset_shim(self, outcome: PaginationShimOutcomes) -> None:
+        try:
+            pagination_offset_shim_counter.labels(outcome=outcome.value).inc()
+        except Exception as e:
+            self._handle_metric_error("record_pagination_offset_shim", e)
+
     def set_embed_now_tasks_in_flight(self, count: int) -> None:
         try:
             embed_now_tasks_in_flight_gauge.labels().set(count)
@@ -338,6 +435,14 @@ class PrometheusMetrics:
             ).inc(count)
         except Exception as e:
             self._handle_metric_error("record_deriver_tokens", e)
+
+    def record_summary_rejection(self, *, summary_type: str, reason: str) -> None:
+        try:
+            summary_rejections_counter.labels(
+                summary_type=summary_type, reason=reason
+            ).inc()
+        except Exception as e:
+            self._handle_metric_error("record_summary_rejection", e)
 
     def record_dialectic_tokens(
         self,
@@ -507,6 +612,18 @@ class PrometheusMetrics:
             # ai: embed_now fast path runs as an API-process background task
             self._touch(embed_now_tasks_shed_counter)
             self.set_embed_now_tasks_in_flight(0)
+            # ai: only processes that can take the shim path emit it (see src/utils/pagination.py)
+            if settings.CACHE.ENABLED and settings.CACHE.PAGINATION_OFFSET_SHIM:
+                for outcome in PaginationShimOutcomes:
+                    self._touch(pagination_offset_shim_counter, outcome=outcome.value)
+
+            self.set_deriver_metrics()
+            self.set_deriver_outstanding_work(seconds=0)
+            self.set_dreams_due(count=0)
+
+            if settings.DERIVER.SCHEDULER == "api":
+                self.set_message_embeddings_pending(count=0)
+                self._initialize_backfill_pending()
 
         elif instance_type == "deriver":
             # deriver tokens: only the valid (token_type, component) tuples per
@@ -533,8 +650,24 @@ class PrometheusMetrics:
                         specialist_name=specialist.name,
                         token_type=token_type.value,
                     )
+            # summary rejections: summary_type x reason.
+            for summary_type in ("short", "long"):
+                self._touch(
+                    summary_rejections_counter,
+                    summary_type=summary_type,
+                    reason=SUMMARY_REJECTION_DEGENERATE,
+                )
             # ai: init at 0 so the gauge is visible before its first per-replica refresh
             self.set_message_embeddings_pending(count=0)
+            if settings.DERIVER.SCHEDULER == "deriver":
+                self._initialize_backfill_pending()
+
+    def _initialize_backfill_pending(self) -> None:
+        """Zero-init ``backfill_pending`` for every registered backfill."""
+        from src.reconciler.backfill import BACKFILLS
+
+        for name in BACKFILLS:
+            self.set_backfill_pending(task=name, count=0)
 
     def set_telemetry_buffer_size(self, *, size: int) -> None:
         try:
@@ -547,6 +680,52 @@ class PrometheusMetrics:
             message_embeddings_pending_gauge.labels().set(count)
         except Exception as e:
             self._handle_metric_error("set_message_embeddings_pending", e)
+
+    def set_backfill_pending(self, *, task: str, count: int) -> None:
+        try:
+            backfill_pending_gauge.labels(task=task).set(count)
+        except Exception as e:
+            self._handle_metric_error("set_backfill_pending", e)
+
+    def set_deriver_metrics(
+        self,
+        *,
+        eligible_work_units: int = 0,
+        claimed_work_units: int = 0,
+        pending_items: int = 0,
+        oldest_pending_age_seconds: float = 0.0,
+        embeddings_pending: int = 0,
+        embeddings_pending_due: int = 0,
+    ) -> None:
+        try:
+            deriver_queue_work_units_eligible_gauge.labels().set(eligible_work_units)
+            deriver_queue_work_units_claimed_gauge.labels().set(claimed_work_units)
+            deriver_queue_items_pending_gauge.labels().set(pending_items)
+            deriver_queue_oldest_pending_age_seconds_gauge.labels().set(
+                oldest_pending_age_seconds
+            )
+            message_embeddings_pending_gauge.labels().set(embeddings_pending)
+            message_embeddings_pending_due_gauge.labels().set(embeddings_pending_due)
+        except Exception as e:
+            self._handle_metric_error("set_deriver_metrics", e)
+
+    def set_deriver_outstanding_work(self, *, seconds: float) -> None:
+        try:
+            deriver_outstanding_work_seconds_gauge.labels().set(seconds)
+        except Exception as e:
+            self._handle_metric_error("set_deriver_outstanding_work", e)
+
+    def set_dreams_due(self, *, count: int) -> None:
+        try:
+            dreams_due_gauge.labels().set(count)
+        except Exception as e:
+            self._handle_metric_error("set_dreams_due", e)
+
+    def set_deriver_metrics_last_success(self, *, timestamp: float) -> None:
+        try:
+            deriver_metrics_last_success_timestamp_gauge.labels().set(timestamp)
+        except Exception as e:
+            self._handle_metric_error("set_deriver_metrics_last_success", e)
 
 
 prometheus_metrics = PrometheusMetrics()

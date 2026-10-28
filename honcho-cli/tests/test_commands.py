@@ -10,9 +10,12 @@ from __future__ import annotations
 import json
 import os
 from contextlib import ExitStack, contextmanager
+from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
 
 import pytest
+from honcho import Message, SessionContext, SessionSummaries, Summary
+from honcho.api_types import QueueStatusResponse, SessionQueueStatus
 from typer.testing import CliRunner
 
 from honcho_cli.commands.session import _next_page_command
@@ -83,6 +86,16 @@ def _patch_view(session: MagicMock, *, peer_id: str = ""):
     return _nested(
         patch("honcho_cli.commands.session.get_client", return_value=(client, config)),
         patch("honcho_cli.commands.session.Session", return_value=session),
+    )
+
+
+def _summary(kind: str) -> Summary:
+    return Summary(
+        content=f"{kind} summary",
+        message_id="m1",
+        summary_type=f"honcho_chat_summary_{kind}",
+        created_at="2026-01-01T00:00:00Z",
+        token_count=3,
     )
 
 
@@ -199,6 +212,105 @@ class TestJsonContract:
             "session_id": "sess1",
             "created_at": "2026-01-01T00:00:00Z",
         }]
+
+    def test_workspace_chat_json_object_shape(self, cfg, runner):
+        cfg.write_text(json.dumps({"apiKey": "k", "environmentUrl": "http://localhost:8000"}))
+        client = MagicMock()
+        client.chat.return_value = "across both peers"
+        config = MagicMock(workspace_id="ws1", session_id="sess1")
+        with patch("honcho_cli.commands.workspace.get_client", return_value=(client, config)):
+            result = runner.invoke(
+                app,
+                ["workspace", "chat", "what themes?", "-w", "ws1", "-s", "sess1", "-r", "low"],
+            )
+        assert result.exit_code == 0, result.stderr
+        assert json.loads(result.stdout) == {
+            "workspace_id": "ws1",
+            "query": "what themes?",
+            "response": "across both peers",
+        }
+        client.chat.assert_called_once_with(
+            "what themes?",
+            session="sess1",
+            reasoning_level="low",
+        )
+
+    def test_workspace_chat_forwards_single_scope(self, cfg, runner):
+        cfg.write_text(json.dumps({"apiKey": "k", "environmentUrl": "http://localhost:8000"}))
+        client = MagicMock()
+        client.chat.return_value = "scoped"
+        config = MagicMock(workspace_id="ws1", session_id="")
+        with patch("honcho_cli.commands.workspace.get_client", return_value=(client, config)):
+            result = runner.invoke(
+                app,
+                ["workspace", "chat", "what themes?", "-w", "ws1", "--scope", "therapy"],
+            )
+        assert result.exit_code == 0, result.stderr
+        client.chat.assert_called_once_with(
+            "what themes?",
+            session=None,
+            reasoning_level=None,
+            scope="therapy",
+        )
+
+    def test_workspace_chat_forwards_scope_allowlist(self, cfg, runner):
+        cfg.write_text(json.dumps({"apiKey": "k", "environmentUrl": "http://localhost:8000"}))
+        client = MagicMock()
+        client.chat.return_value = "allowlist"
+        config = MagicMock(workspace_id="ws1", session_id="")
+        with patch("honcho_cli.commands.workspace.get_client", return_value=(client, config)):
+            result = runner.invoke(
+                app,
+                [
+                    "workspace",
+                    "chat",
+                    "what themes?",
+                    "-w",
+                    "ws1",
+                    "--scope",
+                    "therapy",
+                    "--scope",
+                    "work,home",
+                ],
+            )
+        assert result.exit_code == 0, result.stderr
+        client.chat.assert_called_once_with(
+            "what themes?",
+            session=None,
+            reasoning_level=None,
+            scope=["therapy", "work", "home"],
+        )
+
+    def test_peer_chat_forwards_sessions_allowlist(self, cfg, runner):
+        cfg.write_text(json.dumps({"apiKey": "k", "environmentUrl": "http://localhost:8000"}))
+        peer = MagicMock()
+        peer.chat.return_value = "from those sessions"
+        client = MagicMock()
+        client.peer.return_value = peer
+        config = MagicMock(workspace_id="ws1", peer_id="alice", session_id="")
+        with patch("honcho_cli.commands.peer.get_client", return_value=(client, config)):
+            result = runner.invoke(
+                app,
+                [
+                    "peer",
+                    "chat",
+                    "what happened?",
+                    "-w",
+                    "ws1",
+                    "-p",
+                    "alice",
+                    "--sessions",
+                    "s1,s2",
+                ],
+            )
+        assert result.exit_code == 0, result.stderr
+        peer.chat.assert_called_once_with(
+            "what happened?",
+            target=None,
+            session=None,
+            reasoning_level=None,
+            sessions=["s1", "s2"],
+        )
 
     def test_message_get_returns_single_json_object(self, cfg, runner):
         cfg.write_text(json.dumps({"apiKey": "k", "environmentUrl": "http://localhost:8000"}))
@@ -454,6 +566,107 @@ class TestJsonContract:
         assert payload[-1]["id"] == "m149"
         assert session.messages.call_args.kwargs["size"] == 100
 
+    def test_session_summaries_json_nests_summary_objects(self, cfg, runner):
+        """Summaries are SDK models; they were emitted as their Python repr string."""
+        cfg.write_text(json.dumps({"apiKey": "k", "environmentUrl": "http://localhost:8000"}))
+        sess = MagicMock()
+        sess.summaries.return_value = SessionSummaries(
+            id="sess1", short_summary=_summary("short"), long_summary=None
+        )
+        client = MagicMock()
+        client.session.return_value = sess
+        config = MagicMock(session_id="sess1", workspace_id="ws1")
+        with patch("honcho_cli.commands.session.get_client", return_value=(client, config)):
+            result = runner.invoke(app, ["session", "summaries", "sess1", "-w", "ws1", "--json"])
+        assert result.exit_code == 0, result.stderr
+        assert json.loads(result.stdout) == {
+            "session_id": "sess1",
+            "short_summary": _summary("short").model_dump(),
+            "long_summary": None,
+        }
+
+    def test_session_inspect_json_nests_summary_objects(self, cfg, runner):
+        cfg.write_text(json.dumps({"apiKey": "k", "environmentUrl": "http://localhost:8000"}))
+        sess = MagicMock()
+        sess.peers.return_value = []
+        sess.messages.return_value = _fake_page([], total=0)
+        sess.summaries.return_value = SessionSummaries(
+            id="sess1", short_summary=_summary("short"), long_summary=_summary("long")
+        )
+        sess.get_configuration.return_value = None
+        client = MagicMock()
+        client.session.return_value = sess
+        config = MagicMock(session_id="sess1", workspace_id="ws1")
+        with patch("honcho_cli.commands.session.get_client", return_value=(client, config)):
+            result = runner.invoke(app, ["session", "inspect", "sess1", "-w", "ws1", "--json"])
+        assert result.exit_code == 0, result.stderr
+        assert json.loads(result.stdout)["summaries"] == {
+            "short": _summary("short").model_dump(),
+            "long": _summary("long").model_dump(),
+        }
+
+    def test_session_context_json_nests_summary_and_messages(self, cfg, runner):
+        cfg.write_text(json.dumps({"apiKey": "k", "environmentUrl": "http://localhost:8000"}))
+        message = Message(
+            id="m1",
+            content="hello",
+            peer_id="alice",
+            session_id="sess1",
+            workspace_id="ws1",
+            metadata={},
+            created_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+            token_count=1,
+        )
+        sess = MagicMock()
+        sess.context.return_value = SessionContext(
+            session_id="sess1", messages=[message], summary=_summary("short")
+        )
+        client = MagicMock()
+        client.session.return_value = sess
+        config = MagicMock(session_id="sess1", workspace_id="ws1")
+        with patch("honcho_cli.commands.session.get_client", return_value=(client, config)):
+            result = runner.invoke(app, ["session", "context", "sess1", "-w", "ws1", "--json"])
+        assert result.exit_code == 0, result.stderr
+        assert json.loads(result.stdout) == {
+            "session_id": "sess1",
+            "summary": _summary("short").model_dump(),
+            "peer_representation": None,
+            "peer_card": None,
+            "messages": [{
+                "id": "m1",
+                "peer_id": "alice",
+                "content": "hello",
+                "token_count": 1,
+                "metadata": {},
+                "created_at": "2026-01-01 00:00:00+00:00",
+            }],
+        }
+
+    def test_workspace_queue_status_json_nests_session_status(self, cfg, runner):
+        cfg.write_text(json.dumps({
+            "apiKey": "k",
+            "environmentUrl": "http://localhost:8000",
+            "workspace_id": "ws1",
+        }))
+        counts = {
+            "total_work_units": 2,
+            "completed_work_units": 1,
+            "in_progress_work_units": 0,
+            "pending_work_units": 1,
+        }
+        client = MagicMock()
+        client.queue_status.return_value = QueueStatusResponse(
+            **counts, sessions={"sess1": SessionQueueStatus(session_id="sess1", **counts)}
+        )
+        config = MagicMock(workspace_id="ws1", session_id="")
+        with patch("honcho_cli.commands.workspace.get_client", return_value=(client, config)):
+            result = runner.invoke(app, ["workspace", "queue-status", "-w", "ws1", "--json"])
+        assert result.exit_code == 0, result.stderr
+        assert json.loads(result.stdout) == {
+            **counts,
+            "sessions": {"sess1": {"session_id": "sess1", **counts}},
+        }
+
 
 # --------------------------------------------------------------------------- #
 # 4. Exit codes on error
@@ -478,3 +691,118 @@ class TestExitCodes:
             result = runner.invoke(app, ["peer", "inspect", "missing", "-w", "ws1"])
         assert result.exit_code == 1
         assert json.loads(result.stderr)["error"]["code"] == "PEER_NOT_FOUND"
+
+    def test_workspace_chat_invalid_reasoning_exits_nonzero(self, cfg, runner):
+        cfg.write_text(json.dumps({"apiKey": "k", "environmentUrl": "http://localhost:8000"}))
+        result = runner.invoke(app, ["workspace", "chat", "what themes?", "-w", "ws1", "-r", "nope"])
+        assert result.exit_code == 1
+        assert json.loads(result.stderr)["error"]["code"] == "INVALID_REASONING"
+
+    def test_workspace_chat_scope_and_session_are_exclusive(self, cfg, runner):
+        cfg.write_text(json.dumps({"apiKey": "k", "environmentUrl": "http://localhost:8000"}))
+        config = MagicMock(workspace_id="ws1", session_id="sess1")
+        with patch("honcho_cli.commands.workspace.get_client", return_value=(MagicMock(), config)):
+            result = runner.invoke(
+                app,
+                ["workspace", "chat", "q", "-w", "ws1", "-s", "sess1", "--scope", "therapy"],
+            )
+        assert result.exit_code == 1
+        assert json.loads(result.stderr)["error"]["code"] == "INCOMPATIBLE_FLAGS"
+
+    def test_peer_chat_scope_and_sessions_are_exclusive(self, cfg, runner):
+        cfg.write_text(json.dumps({"apiKey": "k", "environmentUrl": "http://localhost:8000"}))
+        config = MagicMock(workspace_id="ws1", peer_id="alice", session_id="")
+        with patch("honcho_cli.commands.peer.get_client", return_value=(MagicMock(), config)):
+            result = runner.invoke(
+                app,
+                [
+                    "peer",
+                    "chat",
+                    "q",
+                    "-w",
+                    "ws1",
+                    "-p",
+                    "alice",
+                    "--scope",
+                    "therapy",
+                    "--sessions",
+                    "s1",
+                ],
+            )
+        assert result.exit_code == 1
+        assert json.loads(result.stderr)["error"]["code"] == "INCOMPATIBLE_FLAGS"
+
+    def test_workspace_chat_env_session_conflict_names_the_variable(self, cfg, runner):
+        cfg.write_text(json.dumps({"apiKey": "k", "environmentUrl": "http://localhost:8000"}))
+        # session_id populated but no -s typed: it came from HONCHO_SESSION_ID
+        config = MagicMock(workspace_id="ws1", session_id="ambient")
+        with patch("honcho_cli.commands.workspace.get_client", return_value=(MagicMock(), config)):
+            result = runner.invoke(app, ["workspace", "chat", "q", "-w", "ws1", "--scope", "therapy"])
+        assert result.exit_code == 1
+        err = json.loads(result.stderr)["error"]
+        assert err["code"] == "INCOMPATIBLE_FLAGS"
+        assert "--scope was not applied" in err["message"]
+        assert "'ambient' by HONCHO_SESSION_ID" in err["message"]
+        assert "env -u HONCHO_SESSION_ID" in err["message"]
+
+    def test_workspace_chat_bad_scope_keeps_server_message(self, cfg, runner):
+        from honcho import NotFoundError
+
+        cfg.write_text(json.dumps({"apiKey": "k", "environmentUrl": "http://localhost:8000"}))
+        client = MagicMock()
+        client.chat.side_effect = NotFoundError(
+            "Scope no-such-scope not found in workspace ws1"
+        )
+        config = MagicMock(workspace_id="ws1", session_id="")
+        with patch("honcho_cli.commands.workspace.get_client", return_value=(client, config)):
+            result = runner.invoke(
+                app,
+                ["workspace", "chat", "q", "-w", "ws1", "--scope", "no-such-scope"],
+            )
+        assert result.exit_code == 1
+        err = json.loads(result.stderr)["error"]
+        assert err["code"] == "NOT_FOUND"
+        assert err["message"] == "Scope no-such-scope not found in workspace ws1"
+
+
+# --------------------------------------------------------------------------- #
+# `honcho scope` — CRUD over the scopes routes, fail-closed name resolution
+
+class TestScopeCommands:
+    def test_scope_create_with_sessions_json_shape(self, cfg, runner):
+        """create → client.scope(name, metadata) then add_sessions with the flattened CSV list."""
+        cfg.write_text(json.dumps({"apiKey": "k", "environmentUrl": "http://localhost:8000"}))
+        scope = MagicMock(id="therapy", metadata={"team": "care"}, created_at="2026-01-01T00:00:00Z")
+        client = MagicMock()
+        client.scope.return_value = scope
+        with patch("honcho_cli.commands.scope.get_client", return_value=(client, MagicMock(workspace_id="ws1"))):
+            result = runner.invoke(
+                app,
+                [
+                    "scope", "create", "therapy", "-w", "ws1",
+                    "--metadata", '{"team": "care"}',
+                    "--sessions", "s1,s2", "--sessions", "s3",
+                ],
+            )
+        assert result.exit_code == 0, result.stderr
+        assert json.loads(result.stdout) == {
+            "id": "therapy",
+            "metadata": {"team": "care"},
+            "created_at": "2026-01-01T00:00:00Z",
+            "added_sessions": ["s1", "s2", "s3"],
+        }
+        client.scope.assert_called_once_with("therapy", metadata={"team": "care"})
+        scope.add_sessions.assert_called_once_with(["s1", "s2", "s3"])
+
+    def test_scope_inspect_unknown_name_fails_closed(self, cfg, runner):
+        """inspect never calls the get-or-create `client.scope()`; a miss is SCOPE_NOT_FOUND, exit 1."""
+        cfg.write_text(json.dumps({"apiKey": "k", "environmentUrl": "http://localhost:8000"}))
+        client = MagicMock()
+        client.scopes.return_value = [MagicMock(id="work")]
+        with patch("honcho_cli.commands.scope.get_client", return_value=(client, MagicMock(workspace_id="ws1"))):
+            result = runner.invoke(app, ["scope", "inspect", "therapy", "-w", "ws1"])
+        assert result.exit_code == 1
+        err = json.loads(result.stderr)["error"]
+        assert err["code"] == "SCOPE_NOT_FOUND"
+        assert "honcho scope create therapy" in err["message"]
+        client.scope.assert_not_called()
