@@ -9,10 +9,12 @@ from __future__ import annotations
 
 import re
 
-import pyarrow as pa
 import pytest
 
-from src.vector_store.lancedb import LanceDBVectorStore
+pytest.importorskip("lancedb")
+pa = pytest.importorskip("pyarrow")
+
+from src.vector_store.lancedb import LanceDBVectorStore  # noqa: E402
 
 
 @pytest.mark.asyncio
