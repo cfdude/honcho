@@ -131,6 +131,14 @@ repos:
       - id: markdownlint
         args: ['--fix']
         files: \.(md|mdx)$
+        # FORK: generated files are excluded. `openspec update` owns
+        # .claude/skills/openspec-*/ and .claude/commands/opsx/ and rewrites them
+        # in place from upstream templates, so --fix here is worse than useless:
+        # it edits files we do not author, the edits are destroyed on the next
+        # regeneration, and in the meantime they diverge from the template. One
+        # regeneration arrived carrying 4 MD036/MD033 violations and --fix wrote
+        # 47 lines into seven files, blocking the commit either way.
+        exclude: ^\.claude/(skills/openspec-|commands/opsx/)
 
   # Commit message linting
   - repo: https://github.com/commitizen-tools/commitizen
