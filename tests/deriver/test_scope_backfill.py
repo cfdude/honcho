@@ -22,15 +22,19 @@ engine (see ``mock_tracked_db_context`` in conftest.py) — a different
 connection that cannot see another session's uncommitted writes.
 """
 
+import asyncio
+from collections.abc import AsyncGenerator
+from contextlib import asynccontextmanager
 from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
 from nanoid import generate as generate_nanoid
-from sqlalchemy import func, select, update
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import func, insert, select, update
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from src import crud, models
+from src.deriver import scope_backfill as scope_backfill_mod
 from src.deriver.scope_backfill import (
     COPIED_FROM_KEY,
     process_scope_backfill,
@@ -255,6 +259,63 @@ async def test_backfill_copies_only_target_session_explicit_docs(
 # ---------------------------------------------------------------------------
 
 
+async def test_backfill_copies_carry_their_cited_messages(
+    db_session: AsyncSession,
+    sample_data: tuple[models.Workspace, models.Peer],
+):
+    test_workspace, sender = sample_data
+    workspace_name = test_workspace.name
+    scope_peer = await _create_scope_peer(
+        db_session, workspace_name, str(generate_nanoid())
+    )
+    session = await _create_session(db_session, workspace_name)
+    await _join_scope(db_session, workspace_name, session.name, scope_peer.name)
+    messages = [
+        models.Message(
+            session_name=session.name,
+            workspace_name=workspace_name,
+            peer_name=sender.name,
+            content=f"message {seq}",
+            seq_in_session=seq,
+        )
+        for seq in (1, 2)
+    ]
+    db_session.add_all(messages)
+    await db_session.commit()
+    cited = [messages[1].public_id, messages[0].public_id]
+
+    await _create_collection(
+        db_session, workspace_name, observer=sender.name, observed=sender.name
+    )
+    db_session.add(
+        models.Document(
+            workspace_name=workspace_name,
+            observer=sender.name,
+            observed=sender.name,
+            content="some observation",
+            level="explicit",
+            session_name=session.name,
+            embedding=_embedding(),
+            internal_metadata={},
+            source_message_ids=cited,
+        )
+    )
+    await db_session.commit()
+    await _create_collection(
+        db_session, workspace_name, observer=scope_peer.name, observed=sender.name
+    )
+
+    await process_scope_backfill(
+        ScopeBackfillPayload(scope_peer=scope_peer.name, session_name=session.name),
+        workspace_name,
+    )
+
+    [copy] = await _get_docs(
+        db_session, workspace_name, observer=scope_peer.name, observed=sender.name
+    )
+    assert copy.source_message_ids == cited
+
+
 async def test_backfill_processed_twice_is_idempotent(
     db_session: AsyncSession,
     sample_data: tuple[models.Workspace, models.Peer],
@@ -347,6 +408,81 @@ async def test_add_remove_readd_converges_on_one_live_copy(
     assert len(live_copies) == 1
 
 
+async def test_readd_refreshes_a_restored_copys_citations(
+    db_session: AsyncSession,
+    sample_data: tuple[models.Workspace, models.Peer],
+):
+    test_workspace, sender = sample_data
+    workspace_name = test_workspace.name
+    scope_peer = await _create_scope_peer(
+        db_session, workspace_name, str(generate_nanoid())
+    )
+    session = await _create_session(db_session, workspace_name)
+    await _join_scope(db_session, workspace_name, session.name, scope_peer.name)
+    messages = [
+        models.Message(
+            session_name=session.name,
+            workspace_name=workspace_name,
+            peer_name=sender.name,
+            content=f"message {seq}",
+            seq_in_session=seq,
+        )
+        for seq in (1, 2)
+    ]
+    db_session.add_all(messages)
+    await db_session.commit()
+    first, second = messages[0].public_id, messages[1].public_id
+
+    await _create_collection(
+        db_session, workspace_name, observer=sender.name, observed=sender.name
+    )
+    source = models.Document(
+        workspace_name=workspace_name,
+        observer=sender.name,
+        observed=sender.name,
+        content="some observation",
+        level="explicit",
+        session_name=session.name,
+        embedding=_embedding(),
+        internal_metadata={},
+        source_message_ids=[first],
+    )
+    db_session.add(source)
+    await db_session.commit()
+    source_id = source.id
+    await _create_collection(
+        db_session, workspace_name, observer=scope_peer.name, observed=sender.name
+    )
+
+    backfill_payload = ScopeBackfillPayload(
+        scope_peer=scope_peer.name, session_name=session.name
+    )
+    await process_scope_backfill(backfill_payload, workspace_name)
+    await process_scope_removal(
+        ScopeRemovalPayload(scope_peer=scope_peer.name, session_name=session.name),
+        workspace_name,
+    )
+
+    # The source is re-derived while its copy sits soft-deleted.
+    await db_session.execute(
+        insert(models.ConclusionSourceMessage).values(
+            conclusion_id=source_id,
+            message_id=second,
+            position=1,
+            workspace_name=workspace_name,
+        )
+    )
+    await db_session.commit()
+
+    await process_scope_backfill(backfill_payload, workspace_name)
+
+    [copy] = await _get_docs(
+        db_session, workspace_name, observer=scope_peer.name, observed=sender.name
+    )
+    assert copy.deleted_at is None
+    assert copy.source_message_ids == [first, second]
+
+
 async def test_backfill_skips_a_session_that_left_the_scope(
     db_session: AsyncSession,
     sample_data: tuple[models.Workspace, models.Peer],
@@ -413,6 +549,129 @@ async def test_backfill_skips_a_session_that_left_the_scope(
     )
     assert peer is not None
     assert session_name not in peer.internal_metadata.get("backfill_status", {})
+
+
+@pytest.mark.asyncio
+async def test_copy_chunk_membership_lock_blocks_leave_until_write_commits(
+    db_session: AsyncSession,
+    sample_data: tuple[models.Workspace, models.Peer],
+    db_engine: AsyncEngine,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """A concurrent leave cannot commit between membership check and inserts."""
+    test_workspace, sender = sample_data
+    workspace_name = test_workspace.name
+    scope_name = str(generate_nanoid())
+    scope_peer = await _create_scope_peer(db_session, workspace_name, scope_name)
+    session = await _create_session(db_session, workspace_name)
+    await _join_scope(db_session, workspace_name, session.name, scope_peer.name)
+    await _create_collection(
+        db_session, workspace_name, observer=sender.name, observed=sender.name
+    )
+    await _create_collection(
+        db_session, workspace_name, observer=scope_peer.name, observed=sender.name
+    )
+    source = await _create_document(
+        db_session,
+        workspace_name,
+        observer=sender.name,
+        observed=sender.name,
+        session_name=session.name,
+        content="locked membership fact",
+    )
+
+    factory = async_sessionmaker(bind=db_engine, expire_on_commit=False)
+    leave_finished = asyncio.Event()
+    leave_task_box: dict[str, asyncio.Task[None]] = {}
+
+    async def concurrent_leave() -> None:
+        async with factory() as leave_db:
+            await leave_db.execute(
+                update(models.SessionPeer)
+                .where(
+                    models.SessionPeer.workspace_name == workspace_name,
+                    models.SessionPeer.session_name == session.name,
+                    models.SessionPeer.peer_name == scope_peer.name,
+                    models.SessionPeer.left_at.is_(None),
+                )
+                .values(left_at=func.now())
+            )
+            await leave_db.commit()
+        leave_finished.set()
+
+    original_tracked_db = scope_backfill_mod.tracked_db  # pyright: ignore[reportPrivateLocalImportUsage]
+
+    @asynccontextmanager
+    async def tracked_db_with_leave_race(
+        operation_name: str | None = None, *, read_only: bool = False
+    ) -> AsyncGenerator[AsyncSession]:
+        async with original_tracked_db(operation_name, read_only=read_only) as db:
+            if operation_name == "scope_backfill.write":
+                real_scalar = db.scalar
+                raced = False
+
+                async def scalar_then_race(statement: Any, *args: Any, **kwargs: Any):
+                    nonlocal raced
+                    result = await real_scalar(statement, *args, **kwargs)
+                    if not raced and result is not None:
+                        raced = True
+                        leave_task_box["task"] = asyncio.create_task(concurrent_leave())
+                        # Leave's UPDATE must block on this txn's row lock.
+                        for _ in range(50):
+                            await asyncio.sleep(0.01)
+                            if leave_task_box["task"].done():
+                                break
+                        assert not leave_task_box["task"].done()
+                    return result
+
+                db.scalar = scalar_then_race  # type: ignore[method-assign]
+            yield db
+
+    monkeypatch.setattr(scope_backfill_mod, "tracked_db", tracked_db_with_leave_race)
+
+    ok = await scope_backfill_mod._copy_chunk(  # pyright: ignore[reportPrivateUsage]
+        workspace_name,
+        scope_peer.name,
+        session.name,
+        [
+            scope_backfill_mod._CopySpec(  # pyright: ignore[reportPrivateUsage]
+                observed=sender.name,
+                source_id=source.id,
+                content=source.content,
+                embedding=None,
+                internal_metadata={},
+                times_derived=1,
+                source_ids=None,
+                source_message_ids=None,
+                session_name=session.name,
+            )
+        ],
+        store_in_postgres=True,
+    )
+    assert ok is True
+
+    leave_task = leave_task_box["task"]
+    await asyncio.wait_for(leave_task, timeout=2.0)
+    assert leave_finished.is_set()
+
+    copies = await _get_docs(
+        db_session,
+        workspace_name,
+        observer=scope_peer.name,
+        observed=sender.name,
+        include_deleted=False,
+    )
+    assert len(copies) == 1
+    assert copies[0].internal_metadata.get(COPIED_FROM_KEY) == source.id
+
+    membership = await db_session.scalar(
+        select(models.SessionPeer.left_at).where(
+            models.SessionPeer.workspace_name == workspace_name,
+            models.SessionPeer.session_name == session.name,
+            models.SessionPeer.peer_name == scope_peer.name,
+        )
+    )
+    assert membership is not None
 
 
 # ---------------------------------------------------------------------------
@@ -522,7 +781,7 @@ async def test_removal_cascades_to_dependent_derived_docs_only(
         session_name=None,
         content="unrelated deduction",
         level="deductive",
-        source_ids=["some-other-doc-id-not-removed"],
+        source_ids=[generate_nanoid()],
     )
 
     copy_id, dependent_id, unrelated_id = copy.id, dependent.id, unrelated.id
@@ -642,6 +901,82 @@ async def test_removal_enqueues_card_refresh_rebuild_and_omni_dream(
     assert card_refresh_payload["rebuild"] is True
     assert card_refresh_payload["observer"] == scope_peer.name
     assert card_refresh_payload["observed"] == sender.name
+
+
+async def test_removal_clears_dream_notes_but_keeps_the_cursor(
+    db_session: AsyncSession,
+    sample_data: tuple[models.Workspace, models.Peer],
+):
+    """Notes are free text that can describe the removed session, even for a
+    peer it left no conclusions about, and unlike the card they can't be
+    rebuilt, so removal drops them across the scope."""
+    from src.dreamer.working_memory import (
+        EPOCH_KEY,
+        NOTES_KEY,
+        load_map_entries,
+        parse_epoch,
+    )
+
+    test_workspace, sender = sample_data
+    workspace_name = test_workspace.name
+    scope_peer = await _create_scope_peer(
+        db_session, workspace_name, str(generate_nanoid())
+    )
+    other_peer = await _create_peer(db_session, workspace_name)
+    session = await _create_session(db_session, workspace_name)
+    observer, session_name = scope_peer.name, session.name
+    # The session left conclusions about the sender only.
+    observed_peers = [sender.name, other_peer.name]
+    for observed in observed_peers:
+        db_session.add(
+            models.Collection(
+                workspace_name=workspace_name,
+                observer=observer,
+                observed=observed,
+                internal_metadata={
+                    NOTES_KEY: {
+                        "cursor": {"dreams": 2},
+                        "entries": [
+                            {
+                                "id": "n1",
+                                "kind": "map",
+                                "specialist": "deduction",
+                                "text": "talks mostly about the removed project",
+                                "created_dream": 1,
+                                "updated_at": "2026-10-01T00:00:00+00:00",
+                            }
+                        ],
+                    }
+                },
+            )
+        )
+    await db_session.commit()
+    await _create_document(
+        db_session,
+        workspace_name,
+        observer=observer,
+        observed=observed_peers[0],
+        session_name=session_name,
+    )
+
+    await process_scope_removal(
+        ScopeRemovalPayload(scope_peer=observer, session_name=session_name),
+        workspace_name,
+    )
+
+    db_session.expire_all()
+    for observed in observed_peers:
+        assert (
+            await load_map_entries(workspace_name, observer=observer, observed=observed)
+            == []
+        )
+        notes = await crud.get_collection_internal_metadata_value(
+            db_session, workspace_name, observer, observed, NOTES_KEY
+        )
+        assert notes is not None and notes["cursor"] == {"dreams": 2}
+        # Dreams that started before the removal can no longer write notes.
+        assert parse_epoch(notes) is not None
+        assert EPOCH_KEY in notes
 
 
 # ---------------------------------------------------------------------------
@@ -956,3 +1291,87 @@ async def test_backfill_status_writes_preserve_the_scope_kind_flag(
     await db_session.commit()
     metadata = await assert_still_a_scope("clearing the status")
     assert session_name not in metadata.get("backfill_status", {})
+
+
+@pytest.mark.asyncio
+async def test_backfill_embeds_and_writes_in_bounded_chunks(
+    db_session: AsyncSession,
+    sample_data: tuple[models.Workspace, models.Peer],
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Phases 2-4 run per chunk, so a large session never holds every vector."""
+    from src.deriver import scope_backfill
+    from src.embedding_client import embedding_client
+
+    test_workspace, sender = sample_data
+    workspace_name = test_workspace.name
+    scope_name = str(generate_nanoid())
+    scope_peer = await _create_scope_peer(db_session, workspace_name, scope_name)
+    session = await _create_session(db_session, workspace_name)
+    await _join_scope(db_session, workspace_name, session.name, scope_peer.name)
+    await _create_collection(
+        db_session, workspace_name, observer=sender.name, observed=sender.name
+    )
+    await _create_collection(
+        db_session, workspace_name, observer=scope_peer.name, observed=sender.name
+    )
+    for i in range(3):
+        source = await _create_document(
+            db_session,
+            workspace_name,
+            observer=sender.name,
+            observed=sender.name,
+            session_name=session.name,
+            content=f"fact {i}",
+        )
+        source.embedding = None
+    await db_session.commit()
+
+    batch_sizes: list[int] = []
+    seen_specs: list[scope_backfill._CopySpec] = []  # pyright: ignore[reportPrivateUsage]
+    peak_live_embeddings = 0
+    original_embed = embedding_client.simple_batch_embed
+    original_copy_chunk = scope_backfill._copy_chunk  # pyright: ignore[reportPrivateUsage]
+
+    async def recording_embed(texts: list[str], **kwargs: Any) -> list[list[float]]:
+        batch_sizes.append(len(texts))
+        return await original_embed(texts, **kwargs)
+
+    async def counting_copy_chunk(
+        ws_name: str,
+        peer_name: str,
+        sess_name: str,
+        plans: list[scope_backfill._CopySpec],  # pyright: ignore[reportPrivateUsage]
+        store_in_postgres: bool,
+    ) -> bool:
+        nonlocal peak_live_embeddings
+        seen_specs.extend(plans)
+        result = await original_copy_chunk(
+            ws_name, peer_name, sess_name, plans, store_in_postgres
+        )
+        # Sampled after this chunk syncs but before _run_backfill drops its
+        # vectors, so every *earlier* chunk must already be cleared and the
+        # live count can never exceed one chunk. That drop is the whole
+        # memory bound; without it this peaks at 3 instead of 2.
+        peak_live_embeddings = max(
+            peak_live_embeddings,
+            sum(1 for spec in seen_specs if spec.embedding is not None),
+        )
+        return result
+
+    monkeypatch.setattr(scope_backfill, "BACKFILL_CHUNK_SIZE", 2)
+    monkeypatch.setattr(embedding_client, "simple_batch_embed", recording_embed)
+    monkeypatch.setattr(scope_backfill, "_copy_chunk", counting_copy_chunk)
+
+    await process_scope_backfill(
+        ScopeBackfillPayload(scope_peer=scope_peer.name, session_name=session.name),
+        workspace_name,
+    )
+
+    assert batch_sizes == [2, 1]
+    assert peak_live_embeddings == 2
+    copies = await _get_docs(
+        db_session, workspace_name, observer=scope_peer.name, observed=sender.name
+    )
+    assert len(copies) == 3
+    assert all(copy.embedding is not None for copy in copies)

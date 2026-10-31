@@ -1,15 +1,12 @@
 """FastAPI routes for peer resources and peer-scoped operations."""
 
-import json
 import logging
-from collections.abc import AsyncIterator
 from contextlib import suppress
 from time import perf_counter
 
 from fastapi import APIRouter, Body, Depends, Path, Query, Response
 from fastapi.responses import StreamingResponse
-from fastapi_pagination import Page
-from fastapi_pagination.ext.sqlalchemy import apaginate
+from fastapi_pagination.bases import AbstractParams
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -28,15 +25,24 @@ from src.exceptions import (
 from src.security import JWTParams, require_auth
 from src.telemetry import prometheus_metrics
 from src.telemetry.events import EmbeddingCallPurpose, GetContextEvent, emit
+from src.utils.evidence import EvidenceAccumulator
 from src.utils.filter import MAX_SESSION_ALLOWLIST_ENTRIES, extract_session_allowlist
+from src.utils.pagination import (
+    CursorPage,
+    Page,
+    paginate_offset_or_cursor,
+    pagination_params,
+)
 from src.utils.schema_conversion import json_response_schema_to_pydantic
 from src.utils.scopes import (
+    bind_scope_key,
     is_scope_peer,
     is_scope_peer_name,
     validate_no_scope_peer_names,
     validate_scope_read_option,
 )
 from src.utils.search import search
+from src.utils.sse import format_dialectic_sse_stream
 from src.utils.types import embedding_call_purpose
 
 logger = logging.getLogger(__name__)
@@ -80,7 +86,7 @@ async def _resolve_scope_option(
 
 @router.post(
     "/list",
-    response_model=Page[schemas.Peer],
+    response_model=Page[schemas.Peer] | CursorPage[schemas.Peer],
     dependencies=[Depends(require_auth(workspace_name="workspace_id"))],
 )
 async def get_peers(
@@ -89,6 +95,7 @@ async def get_peers(
         None, description="Filtering options for the peers list"
     ),
     reverse: bool = Query(False, description="Whether to reverse the order of results"),
+    params: AbstractParams = Depends(pagination_params),
     db: AsyncSession = read_db,
 ):
     """Get all Peers for a Workspace, paginated with optional filters.
@@ -102,7 +109,7 @@ async def get_peers(
         if filter_param == {}:
             filter_param = None
 
-    return await apaginate(
+    return await paginate_offset_or_cursor(
         db,
         await crud.get_peers(
             workspace_name=workspace_id,
@@ -110,6 +117,7 @@ async def get_peers(
             reverse=reverse,
             kind=options.kind if options else None,
         ),
+        params,
     )
 
 
@@ -132,6 +140,11 @@ async def get_or_create_peer(
     """
     # validate workspace query param
     if not jwt_params.ad and jwt_params.w is not None and jwt_params.w != workspace_id:
+        raise AuthenticationException("Unauthorized access to resource")
+
+    # A session-scoped key is confined to its session and has no peer of its
+    # own, so it cannot get-or-create peers (which overwrites existing ones).
+    if not jwt_params.ad and jwt_params.s is not None:
         raise AuthenticationException("Unauthorized access to resource")
 
     if peer.name:
@@ -193,7 +206,7 @@ async def update_peer(
 
 @router.post(
     "/{peer_id}/sessions",
-    response_model=Page[schemas.Session],
+    response_model=Page[schemas.Session] | CursorPage[schemas.Session],
     dependencies=[
         Depends(require_auth(workspace_name="workspace_id", peer_name="peer_id"))
     ],
@@ -205,6 +218,7 @@ async def get_sessions_for_peer(
         None, description="Filtering options for the sessions list"
     ),
     reverse: bool = Query(False, description="Whether to reverse the order of results"),
+    params: AbstractParams = Depends(pagination_params),
     db: AsyncSession = read_db,
 ):
     """Get all Sessions for a Peer, paginated with optional filters."""
@@ -215,7 +229,7 @@ async def get_sessions_for_peer(
         if filter_param == {}:
             filter_param = None
 
-    return await apaginate(
+    return await paginate_offset_or_cursor(
         db,
         await crud.get_sessions_for_peer(
             workspace_name=workspace_id,
@@ -223,11 +237,13 @@ async def get_sessions_for_peer(
             filters=filter_param,
             reverse=reverse,
         ),
+        params,
     )
 
 
 @router.post(
     "/{peer_id}/chat",
+    summary="Peer Chat",
     responses={
         200: {
             "content": {
@@ -244,13 +260,16 @@ async def chat(
     peer_id: str = Path(...),
     options: schemas.DialecticOptions = Body(...),
     jwt_params: JWTParams = Depends(
-        require_auth(workspace_name="workspace_id", peer_name="peer_id")
+        require_auth(
+            workspace_name="workspace_id", peer_name="peer_id", allow_scope=True
+        )
     ),
 ):
     """
     Query a Peer's representation using natural language. Performs agentic search and reasoning to comprehensively
     answer the query based on all latent knowledge gathered about the peer from their messages and conclusions.
     """
+    options.scope = bind_scope_key(options.scope, jwt_params)
     # Scope peers are never observed, so no representation of them exists to
     # query. Covers the path-level observer too: a scope `peer_id` no longer
     # errors out downstream now that crud.get_peer takes a plain name, and
@@ -358,17 +377,9 @@ async def chat(
         await peer_db.commit()
     await peers_result.post_commit()
 
+    evidence = EvidenceAccumulator() if options.include_evidence else None
+
     if options.stream:
-        # Stream the response using Server-Sent Events
-
-        async def format_sse_stream(
-            chunks: AsyncIterator[str],
-        ) -> AsyncIterator[str]:
-            """Format chunks as SSE events."""
-            async for chunk in chunks:
-                yield f"data: {json.dumps({'delta': {'content': chunk}, 'done': False})}\n\n"
-            yield f"data: {json.dumps({'done': True})}\n\n"
-
         # Prometheus metrics
         if settings.METRICS.ENABLED:
             prometheus_metrics.record_dialectic_call(
@@ -377,7 +388,7 @@ async def chat(
             )
 
         return StreamingResponse(
-            format_sse_stream(
+            format_dialectic_sse_stream(
                 agentic_chat_stream(
                     workspace_name=workspace_id,
                     session_name=options.session_id,
@@ -387,7 +398,9 @@ async def chat(
                     reasoning_level=options.reasoning_level,
                     session_allowlist=session_allowlist,
                     response_model=response_model,
-                )
+                    evidence=evidence,
+                ),
+                evidence,
             ),
             media_type="text/event-stream",
         )
@@ -404,6 +417,7 @@ async def chat(
         reasoning_level=options.reasoning_level,
         session_allowlist=session_allowlist,
         response_model=response_model,
+        evidence=evidence,
     )
 
     # Prometheus metrics
@@ -413,7 +427,10 @@ async def chat(
             reasoning_level=options.reasoning_level,
         )
 
-    return schemas.DialecticResponse(content=response if response else None)
+    return schemas.DialecticResponse(
+        content=response if response else None,
+        evidence=evidence.build() if evidence is not None else None,
+    )
 
 
 @router.post(
@@ -427,7 +444,9 @@ async def get_representation(
         ..., description="Options for getting the peer representation"
     ),
     jwt_params: JWTParams = Depends(
-        require_auth(workspace_name="workspace_id", peer_name="peer_id")
+        require_auth(
+            workspace_name="workspace_id", peer_name="peer_id", allow_scope=True
+        )
     ),
 ):
     """Get a curated subset of a Peer's Representation. A Representation is always a subset of the total
@@ -438,6 +457,7 @@ async def get_representation(
     If a target is provided, we get the Representation of the target from the perspective of the Peer.
     If no target is provided, we get the omniscient Honcho Representation of the Peer.
     """
+    options.scope = bind_scope_key(options.scope, jwt_params)
     # Fast-fail before any embedding work. Same guard as the authoritative one
     # below, so a reserved name is refused here rather than after paying for an
     # embedding; the check is repeated at the read because this session closes and
@@ -487,6 +507,11 @@ async def get_representation(
         embedding: list[float] | None = None
         if options.search_query:
             try:
+                # Truncate oversized user queries instead of dropping semantic
+                # search; embed() stays strict so agent queries still fail.
+                options.search_query = embedding_client.truncate_to_token_limit(
+                    options.search_query
+                )
                 with embedding_call_purpose(
                     EmbeddingCallPurpose.SEARCH_MEMORY.value,
                     workspace_name=workspace_id,
@@ -722,6 +747,9 @@ async def get_peer_context(
                     parent_category="api",
                 ),
             ):
+                # Truncate oversized user queries instead of dropping semantic
+                # search; embed() stays strict so agent queries still fail.
+                search_query = embedding_client.truncate_to_token_limit(search_query)
                 embedding = await embedding_client.embed(search_query)
 
         # Get the working representation
@@ -730,7 +758,9 @@ async def get_peer_context(
             observer=peer_id,
             observed=observed,
             session_allowlist=None,  # Peer context is global, not session-scoped
-            include_semantic_query=search_query,
+            # Semantic search only with an embedding; otherwise the downstream
+            # fallback re-embeds a query that already failed.
+            include_semantic_query=search_query if embedding is not None else None,
             embedding=embedding,
             semantic_search_top_k=search_top_k,
             semantic_search_max_distance=search_max_distance,

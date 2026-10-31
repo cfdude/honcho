@@ -5,6 +5,49 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](http://keepachangelog.com/)
 and this project adheres to [Semantic Versioning](http://semver.org/).
 
+## [Unreleased]
+
+### Security
+
+- Requires `certifi` 2026.10.19 or newer, the first CA bundle without the emSign root behind the compromised eMudhra intermediates. The client verifies TLS with httpx's default, which reads certifi, so upgrading the SDK now upgrades the bundle in the app's environment too. An app that pins an older `certifi` must raise that pin to upgrade
+
+## [2.7.0] - 2026-10-20
+
+### Added
+
+- `Conclusion.source_message_ids`: the messages the deriver cited as evidence for an explicit conclusion (Honcho v3.4.0+). None for derived levels and for conclusions recorded before citations existed. Filter with `{"source_message_ids": {"contains": "<message_id>"}}` to find the conclusions that cite a message as evidence
+- `uid` on `Peer`, `Session` and the `Honcho` client (the workspace), plus on `PeerResponse`, `SessionResponse` and `WorkspaceResponse`: the immutable identifier the server assigns, next to the client-chosen `id`. Set from any API response that returns the object, and `None` before the first fetch or against servers that don't return it (#1394)
+
+### Fixed
+
+- The async client (`.aio`) builds a new `httpx.AsyncClient` when the running event loop changes, instead of reusing the first loop's client on every later loop. A `Honcho` kept across `asyncio.run()` calls (a module-level client in a Lambda handler, a sync view or a CLI) no longer fails its first request on a new loop with `ConnectionError: Event loop is closed` when the previous loop left a pooled connection, sometimes after the write had been stored. A client set directly on `_async_http` is still used as is, and each thread running its own loop should use its own `Honcho` (#1357)
+
+## [2.6.0] - 2026-10-07
+
+### Added
+
+- `custom_instructions` on `WorkspaceConfiguration` and `SessionConfiguration` (the shared fallback) and on `SummaryConfiguration`, `DreamConfiguration`, and `PeerCardConfiguration`, plus a new `DialecticConfiguration` type under the `dialectic` key. Requires Honcho v3.3.0+ (#1303)
+
+## [2.5.1] - 2026-09-22
+
+### Added
+
+- `observer_id` and `observed_id` on `EvidenceObservation`, so evidence from workspace chat says which peer pair each conclusion belongs to. Previously the SDK dropped these fields. Requires Honcho v3.2.1+ (#1220)
+
+### Changed
+
+- `Conclusion.source_ids` is `[]` rather than `None` for explicit conclusions when talking to Honcho v3.2.1+. The type still admits `None` for older servers (#1193)
+
+## [2.5.0] - 2026-09-15
+
+### Added
+
+- `honcho.get_scope(id)` (sync and async) fetches an existing scope by ID and raises `NotFoundError` when it does not exist. Unlike `honcho.scope()`, it never creates the scope, so lookups cannot provision a recall boundary by accident (#1163)
+- Optional per-call `timeout` on synchronous and asynchronous `Peer.chat()`. It overrides the timeout for each HTTP attempt; when omitted or set to `None`, the client-wide timeout configured on `Honcho` remains in effect (#1098)
+- `include_evidence` on peer and workspace chat (sync, async, and streaming). Opting in returns a `ChatResponse` carrying the answer plus the conclusions, messages, and tool calls the dialectic read; leaving it out returns the answer on its own, so existing callers are unaffected. Streaming exposes `.evidence` once the stream is drained. Requires a Honcho server with the matching API support (Honcho v3.2.0+) (#1130)
+- `source_ids` and `times_derived` on `Conclusion`. `ConclusionsView.get(id)` / `get_many(ids)` / `derived(id)` and the workspace-level `honcho.conclusions.get` / `get_many` fetch a conclusion with attribution or walk the reasoning tree upward (source → derived). Requires a Honcho server with the matching API support (Honcho v3.2.0+) (#952)
+- SDK requests send `X-Honcho-Host: honcho-python/<version> (platform)` so CloudEvents can split harness vs direct SDK vs raw REST traffic. A caller-supplied `X-Honcho-Host` still wins (#1182)
+
 ## [2.4.0] - 2026-08-25
 
 ### Added

@@ -7,6 +7,8 @@
 - max-iteration handling and synthesis call
 - stream-final-only mode
 - empty-response retry (one retry nudge when the model returns empty content)
+- structured-answer check (a final answer that misses `response_model` is
+  retried like a provider error)
 """
 
 from __future__ import annotations
@@ -14,36 +16,43 @@ from __future__ import annotations
 import dataclasses
 import functools
 import logging
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import (
+    AsyncGenerator,
+    AsyncIterator,
+    Awaitable,
+    Callable,
+    Collection,
+)
 from typing import Any, ParamSpec, TypeVar
 
 from pydantic import BaseModel
-from tenacity import retry, stop_after_attempt, wait_exponential
+from tenacity import RetryCallState, retry, stop_after_attempt, wait_exponential
 
 from src.config import ModelTransport
 from src.exceptions import ValidationException
 from src.utils.types import (
+    get_last_tool_error,
     get_last_tool_metadata,
     iteration_scope,
     set_current_iteration,
     set_current_tool_call_seq,
+    set_last_tool_error,
     set_last_tool_metadata,
 )
 
-from .capture import (
-    build_captured_call,
-    dispatch_captured_call,
-    has_exporters,
-)
-from .executor import honcho_llm_call_inner, infer_provider_label
+from .errors import llm_retry_condition
+from .executor import honcho_llm_call_inner
 from .registry import history_adapter_for_provider
 from .runtime import (
     AttemptPlan,
+    CapturedAgentSpan,
     current_attempt,
     effective_temperature,
-    start_langfuse_agent_step,
+    start_captured_span,
 )
+from .structured_output import StructuredOutputError
 from .types import (
+    BudgetLine,
     HonchoLLMCallResponse,
     HonchoLLMCallStreamChunk,
     IterationCallback,
@@ -74,17 +83,6 @@ def _with_iteration_scope(
     return wrapper
 
 
-def _step_label(base: LLMTelemetryContext | None) -> str:
-    """Stable per-agent step-span name, e.g. "Dialectic Agent step".
-
-    No step number — Langfuse aggregates by name; the index rides on the
-    ``iteration`` metadata. The " step" suffix distinguishes it from the bare
-    agent name, which names the enclosing run trace (see
-    `start_langfuse_agent_run`).
-    """
-    return f"{(base.track_name if base else None) or 'Agent'} step"
-
-
 def _telemetry_for_iteration(
     base: LLMTelemetryContext | None,
     iteration: int,
@@ -107,46 +105,6 @@ def _telemetry_for_iteration(
         step_seq=step_seq,
         parent_span_id=base.span_identity(),
     )
-
-
-def _make_stream_capture_finalizer(
-    telemetry: LLMTelemetryContext | None,
-    plan: AttemptPlan,
-    messages: list[dict[str, Any]],
-) -> Callable[[str, str], None] | None:
-    """Build the streamed-call capture finalizer, or None when capture is off.
-
-    Snapshots the input messages now and returns a closure the streaming wrapper
-    calls on drain with `(streamed_text, finish_reason)`. Tool calls already ran
-    in the loop, so the final streamed turn is text-only. Returns None when no
-    exporter is registered.
-    """
-    if not has_exporters():
-        return None
-    captured_messages = list(messages)
-
-    def _finalize(text: str, finish_reason: str) -> None:
-        from .backend import CompletionResult as BackendCompletionResult
-
-        result = BackendCompletionResult(content=text, finish_reason=finish_reason)
-        dispatch_captured_call(
-            build_captured_call(
-                telemetry=telemetry,
-                transport=str(plan.provider),
-                provider_label=infer_provider_label(plan.provider, plan.model, plan),
-                model=plan.model,
-                messages=captured_messages,
-                tools=None,
-                tool_choice=None,
-                result=result,
-                attempt=plan.attempt,
-                was_fallback=plan.is_fallback,
-                was_stream=True,
-                finish_reason=finish_reason,
-            )
-        )
-
-    return _finalize
 
 
 def _emit_agent_iteration(
@@ -204,6 +162,34 @@ logger = logging.getLogger(__name__)
 # Bounds for max_tool_iterations to prevent runaway loops.
 MIN_TOOL_ITERATIONS = 1
 MAX_TOOL_ITERATIONS = 100
+
+
+def _require_structured_answer(
+    response: HonchoLLMCallResponse[Any],
+    response_model: type[BaseModel] | None,
+    *,
+    allow_empty: bool,
+) -> None:
+    """Raise when a final answer did not parse into `response_model`.
+
+    A backend that degrades instead of raising (an OpenAI refusal, json_object
+    mode's empty answer for a model with required fields) hands back a plain
+    string. Runs inside the retried call, so the miss consumes an attempt and
+    the last attempt reaches the fallback. `allow_empty` lets an empty answer
+    through to the one-shot empty-response nudge.
+    """
+    if response_model is None or response.tool_calls_made:
+        return
+    content = response.content
+    if isinstance(content, BaseModel):
+        return
+    if allow_empty and isinstance(content, str) and not content.strip():
+        return
+    # The content itself stays out of the message: a refusal can quote the
+    # conversation.
+    raise StructuredOutputError(
+        f"Final answer is {type(content).__name__}, not {response_model.__name__}"
+    )
 
 
 def format_assistant_tool_message(
@@ -271,7 +257,8 @@ async def stream_final_response(
     bleed the outer current_attempt ContextVar into streaming retries,
     potentially rolling the selection back to primary after the tool loop
     had already settled on fallback. Tenacity retries re-issue the same
-    streaming call against the same pinned model for transient errors.
+    streaming call against the same pinned model for transient errors, and
+    stop on a non-retryable client error, since no other model is reachable.
     """
 
     # Bump the per-retry attempt index inside `_setup_stream`. The pinned
@@ -279,13 +266,6 @@ async def stream_final_response(
     # this counter, every retried stream-setup emit reports the same attempt
     # value — telemetry can't tell the retry sequence apart.
     stream_attempt = 0
-
-    # No ContextVar gymnastics around `_in_agent_run` here: the run handle
-    # is alive for the lifetime of the stream (owned by
-    # `StreamingResponseWithMetadata` and closed on drain), so this streamed
-    # generation correctly nests under the run span as the current OTel
-    # observation. The previous code had to flip `_in_agent_run` to escape
-    # the run; with imperative handles the run isn't going anywhere.
 
     async def _setup_stream() -> AsyncIterator[HonchoLLMCallStreamChunk]:
         nonlocal stream_attempt
@@ -323,16 +303,113 @@ async def stream_final_response(
 
     if enable_retry:
         wrapped = retry(
+            retry=llm_retry_condition(
+                can_fall_back=False,
+                retry_attempts=retry_attempts,
+                model=f"{winning_plan.provider}/{winning_plan.model}",
+            ),
             stop=stop_after_attempt(retry_attempts),
             wait=wait_exponential(multiplier=1, min=4, max=10),
             before_sleep=before_retry_callback,
+            # Surface the provider's own error once the budget is spent.
+            # Without this tenacity raises RetryError, which erases the cause
+            # and lands every outage on the generic 500 handler.
+            reraise=True,
         )(_setup_stream)
         stream = await wrapped()
     else:
         stream = await _setup_stream()
 
-    async for chunk in stream:
-        yield chunk
+    try:
+        async for chunk in stream:
+            yield chunk
+    finally:
+        if isinstance(stream, AsyncGenerator):
+            await stream.aclose()
+
+
+async def _execute_tool_calls(
+    tool_calls: list[dict[str, Any]],
+    tool_executor: Callable[[str, dict[str, Any]], Any],
+    all_tool_calls: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], set[str]]:
+    """Run one response's tool calls in order.
+
+    Successful calls are appended to `all_tool_calls`. Returns the results to
+    send back to the model and the names of the tools that succeeded.
+    """
+    tool_results: list[dict[str, Any]] = []
+    succeeded_tools: set[str] = set()
+    for seq, tool_call in enumerate(tool_calls):
+        tool_name = tool_call["name"]
+        tool_input = tool_call["input"]
+        tool_id = tool_call.get("id", "")
+
+        logger.debug(f"Executing tool: {tool_name}")
+
+        # the executor closure reads these from
+        # ContextVars to populate AgentToolCallCompletedEvent. Set BEFORE
+        # the executor call so two calls to the same tool in one iteration
+        # get distinct seq values. Reset last-tool metadata so we never
+        # observe stale state from a prior call.
+        set_current_tool_call_seq(seq, tool_id or None)
+        set_last_tool_metadata({})
+        set_last_tool_error(False)
+
+        try:
+            tool_result = await tool_executor(tool_name, tool_input)
+            # Stash ToolResult.metadata on all_tool_calls so
+            # specialist rollups can read created/deleted observation
+            # counts without round-tripping through the event store.
+            tool_result_metadata = get_last_tool_metadata()
+            # The executor reports handler failures as returned
+            # strings, so a normal return is not proof of success.
+            if not get_last_tool_error():
+                succeeded_tools.add(tool_name)
+            tool_results.append(
+                {
+                    "tool_id": tool_id,
+                    "tool_name": tool_name,
+                    "result": tool_result,
+                }
+            )
+            all_tool_calls.append(
+                {
+                    "tool_name": tool_name,
+                    "tool_input": tool_input,
+                    "tool_result": tool_result,
+                    "tool_result_metadata": tool_result_metadata,
+                }
+            )
+        except Exception as e:
+            logger.error(f"Tool execution failed for {tool_name}: {e}")
+            tool_results.append(
+                {
+                    "tool_id": tool_id,
+                    "tool_name": tool_name,
+                    "result": f"Error: {str(e)}",
+                    "is_error": True,
+                }
+            )
+    return tool_results, succeeded_tools
+
+
+def _append_budget_line(
+    conversation_messages: list[dict[str, Any]],
+    budget_line: BudgetLine | None,
+    rounds_used: int,
+    round_limit: int,
+) -> None:
+    """Append the caller's budget line, if any, as the newest user turn.
+
+    It goes after the tool results rather than into the system prompt, so the
+    cached prefix of the conversation stays stable.
+    """
+    if budget_line is None:
+        return
+    line = budget_line(rounds_used, round_limit)
+    if line:
+        conversation_messages.append({"role": "user", "content": line})
 
 
 @_with_iteration_scope
@@ -355,10 +432,15 @@ async def execute_tool_loop(
     max_input_tokens: int | None,
     get_attempt_plan: Callable[[], AttemptPlan],
     before_retry_callback: Callable[[Any], None],
+    retry_condition: Callable[[RetryCallState], bool],
     stream_final: bool = False,
     iteration_callback: IterationCallback | None = None,
     telemetry: LLMTelemetryContext | None = None,
-    langfuse_run_handle: Any | None = None,
+    run_span: CapturedAgentSpan | None = None,
+    force_tools_until: Collection[str] | None = None,
+    max_forced_iterations: int = 3,
+    budget_line: BudgetLine | None = None,
+    final_call_tools: list[dict[str, Any]] | None = None,
 ) -> HonchoLLMCallResponse[Any] | StreamingResponseWithMetadata:
     """Run the iterative tool calling loop for agentic LLM interactions.
 
@@ -366,7 +448,16 @@ async def execute_tool_loop(
       1. Make an LLM call with tools available
       2. Execute any tool calls the LLM requests
       3. Append tool results to the conversation
-      4. Repeat until the LLM stops calling tools or max iterations reached
+      4. Optionally append a budget line (see `budget_line`)
+      5. Repeat until the LLM stops calling tools or max iterations reached
+
+    When the iteration limit is reached, one final call is made. By default
+    it offers no tools, so the model must answer. With `final_call_tools`, it
+    offers those tools instead (for an agent whose output is its writes), and
+    any calls it makes are executed; no further call follows them.
+
+    Each iteration and the final call retry under `retry_condition`, which
+    the caller builds with `llm_retry_condition` for its model config.
 
     Returns:
         Final HonchoLLMCallResponse with accumulated token counts and tool call
@@ -379,6 +470,11 @@ async def execute_tool_loop(
             "max_tool_iterations must be in "
             + f"[{MIN_TOOL_ITERATIONS}, {MAX_TOOL_ITERATIONS}]; "
             + f"got {max_tool_iterations}"
+        )
+    if final_call_tools and stream_final:
+        raise ValidationException(
+            "final_call_tools cannot be combined with stream_final: the final "
+            + "call would have to both stream an answer and run tools"
         )
 
     conversation_messages: list[dict[str, Any]] = (
@@ -406,12 +502,18 @@ async def execute_tool_loop(
     # DialecticCompletedEvent.hit_input_token_cap reflect the cap hit
     # (the toolless path tracks this in src/llm/api.py:325-340).
     hit_input_token_cap = False
-    # Track effective tool_choice — switches from "required"/"any" to "auto" after iter 1.
+    # A forced tool_choice ("required"/"any") relaxes to "auto" once a tool in
+    # `force_tools_until` has run, or after `max_forced_iterations` rounds so a
+    # model that keeps dodging still gets to answer. With no gate, the first
+    # successful round is enough.
     effective_tool_choice = tool_choice
+    # An empty gate would be unsatisfiable, so it means no gate.
+    gate = frozenset(force_tools_until or ()) or None
+    forced_rounds = 0
 
     while iteration < max_tool_iterations:
-        step = start_langfuse_agent_step(
-            _step_label(telemetry),
+        step = start_captured_span(
+            "step",
             _telemetry_for_iteration(telemetry, iteration + 1, step_seq=iteration + 1),
         )
         try:
@@ -428,15 +530,32 @@ async def execute_tool_loop(
                     conversation_messages, max_input_tokens
                 )
 
+            # A provider can ignore a forced tool_choice and answer outright.
+            # While the gate is unmet, a no-tool answer is discarded for a
+            # nudge, so it isn't held to `response_model`. Nor is it under
+            # stream_final, which streams the answer afresh and doesn't
+            # validate it.
+            gate_nudge_due = (
+                gate is not None
+                and effective_tool_choice in ("required", "any")
+                and forced_rounds + 1 < max_forced_iterations
+                and iteration < max_tool_iterations - 1
+            )
+            empty_nudge_due = (
+                empty_response_retries < 1 and iteration < max_tool_iterations - 1
+            )
+
             async def _call_with_messages(
                 tool_choice_for_call: str
                 | dict[str, Any]
                 | None = effective_tool_choice,
                 captured_messages: list[dict[str, Any]] = conversation_messages,
                 iteration_for_call: int = iteration + 1,
+                check_answer: bool = not gate_nudge_due,
+                allow_empty_answer: bool = empty_nudge_due,
             ) -> HonchoLLMCallResponse[Any]:
                 plan = get_attempt_plan()
-                return await honcho_llm_call_inner(
+                result = await honcho_llm_call_inner(
                     plan.provider,
                     plan.model,
                     prompt,  # ignored when messages is passed
@@ -459,16 +578,27 @@ async def execute_tool_loop(
                         telemetry, iteration_for_call, step_seq=iteration_for_call
                     ),
                 )
+                if check_answer and not stream_final:
+                    _require_structured_answer(
+                        result, response_model, allow_empty=allow_empty_answer
+                    )
+                return result
 
             call_func: Callable[[], Awaitable[HonchoLLMCallResponse[Any]]]
             if enable_retry:
                 call_func = retry(
+                    retry=retry_condition,
                     stop=stop_after_attempt(retry_attempts),
                     wait=wait_exponential(multiplier=1, min=4, max=10),
                     before_sleep=before_retry_callback,
+                    # Surface the provider's own error once the budget is
+                    # spent. Without this tenacity raises RetryError, which
+                    # erases the cause and lands every outage on the generic
+                    # 500 handler.
+                    reraise=True,
                 )(_call_with_messages)
             else:
-                call_func = _call_with_messages  # pyright: ignore[reportGeneralTypeIssues]
+                call_func = _call_with_messages
 
             response = await call_func()
 
@@ -482,23 +612,30 @@ async def execute_tool_loop(
             # an empty tool_calls list and is essential for cost calibration.
             _emit_agent_iteration(telemetry, iteration + 1, response)
 
-            # Step span is current again (the generation closed); stamp this
-            # turn's I/O so it isn't blank.
-            if step is not None:
-                step.annotate_io(
-                    conversation_messages,
-                    response.content,
-                    response.tool_calls_made,
-                )
-
             if not response.tool_calls_made:
                 logger.debug("No tool calls in response, finishing")
+
+                # While the gate is unmet, spend a forced round on a nudge
+                # instead of returning that answer; at the cap, keep it.
+                if gate_nudge_due and gate is not None:
+                    forced_rounds += 1
+                    conversation_messages.append(
+                        {
+                            "role": "user",
+                            "content": (
+                                "Your last response called no tool. Call one of "
+                                + ", ".join(sorted(gate))
+                                + " to read the relevant memory before answering."
+                            ),
+                        }
+                    )
+                    iteration += 1
+                    continue
 
                 if (
                     isinstance(response.content, str)
                     and not response.content.strip()
-                    and empty_response_retries < 1
-                    and iteration < max_tool_iterations - 1
+                    and empty_nudge_due
                 ):
                     empty_response_retries += 1
                     conversation_messages.append(
@@ -550,10 +687,7 @@ async def execute_tool_loop(
                         thinking_content=response.thinking_content,
                         iterations=iteration + 1,
                         hit_input_token_cap=hit_input_token_cap,
-                        langfuse_run_handle=langfuse_run_handle,
-                        capture_finalizer=_make_stream_capture_finalizer(
-                            stream_telemetry, winning_plan, conversation_messages
-                        ),
+                        run_span=run_span,
                     )
 
                 response.tool_calls_made = all_tool_calls
@@ -582,55 +716,15 @@ async def execute_tool_loop(
             # Telemetry context — 1-indexed iteration.
             set_current_iteration(iteration + 1)
 
-            tool_results: list[dict[str, Any]] = []
-            for seq, tool_call in enumerate(response.tool_calls_made):
-                tool_name = tool_call["name"]
-                tool_input = tool_call["input"]
-                tool_id = tool_call.get("id", "")
-
-                logger.debug(f"Executing tool: {tool_name}")
-
-                # the executor closure reads these from
-                # ContextVars to populate AgentToolCallCompletedEvent. Set BEFORE
-                # the executor call so two calls to the same tool in one iteration
-                # get distinct seq values. Reset last-tool metadata so we never
-                # observe stale state from a prior call.
-                set_current_tool_call_seq(seq, tool_id or None)
-                set_last_tool_metadata({})
-
-                try:
-                    tool_result = await tool_executor(tool_name, tool_input)
-                    # Stash ToolResult.metadata on all_tool_calls so
-                    # specialist rollups can read created/deleted observation
-                    # counts without round-tripping through the event store.
-                    tool_result_metadata = get_last_tool_metadata()
-                    tool_results.append(
-                        {
-                            "tool_id": tool_id,
-                            "tool_name": tool_name,
-                            "result": tool_result,
-                        }
-                    )
-                    all_tool_calls.append(
-                        {
-                            "tool_name": tool_name,
-                            "tool_input": tool_input,
-                            "tool_result": tool_result,
-                            "tool_result_metadata": tool_result_metadata,
-                        }
-                    )
-                except Exception as e:
-                    logger.error(f"Tool execution failed for {tool_name}: {e}")
-                    tool_results.append(
-                        {
-                            "tool_id": tool_id,
-                            "tool_name": tool_name,
-                            "result": f"Error: {str(e)}",
-                            "is_error": True,
-                        }
-                    )
+            tool_results, succeeded_tools = await _execute_tool_calls(
+                response.tool_calls_made, tool_executor, all_tool_calls
+            )
 
             append_tool_results(current_provider, tool_results, conversation_messages)
+
+            _append_budget_line(
+                conversation_messages, budget_line, iteration + 1, max_tool_iterations
+            )
         finally:
             if step is not None:
                 step.end()
@@ -651,12 +745,16 @@ async def execute_tool_loop(
             except Exception:
                 logger.warning("iteration_callback failed", exc_info=True)
 
-        # After first iteration, switch "required"/"any" → "auto" so the model can stop.
-        if iteration == 0 and effective_tool_choice in ("required", "any"):
-            effective_tool_choice = "auto"
-            logger.debug(
-                "Switched tool_choice from 'required'/'any' to 'auto' after first iteration"
-            )
+        if effective_tool_choice in ("required", "any"):
+            forced_rounds += 1
+            gate_met = gate is None or bool(succeeded_tools & gate)
+            if gate_met or forced_rounds >= max_forced_iterations:
+                effective_tool_choice = "auto"
+                logger.debug(
+                    "Relaxed tool_choice to 'auto' after %d forced round(s) (gate_met=%s)",
+                    forced_rounds,
+                    gate_met,
+                )
 
         iteration += 1
 
@@ -668,11 +766,20 @@ async def execute_tool_loop(
     # AgentIterationEvent and this LLMCallCompletedEvent line up sequentially.
     synthesis_iteration = iteration + 1
 
-    synthesis_prompt = (
-        "You have reached the maximum number of tool calls. "
-        "Based on all the information you have gathered, provide your final response now. "
-        "Do not attempt to call any more tools."
-    )
+    if final_call_tools:
+        final_tool_names = ", ".join(f"`{t['name']}`" for t in final_call_tools)
+        synthesis_prompt = (
+            "You have reached the maximum number of tool calls. "
+            f"You may make one final call to {final_tool_names} to save what you "
+            "have decided on; no other tools are available. If there is nothing "
+            "to save, respond without calling a tool."
+        )
+    else:
+        synthesis_prompt = (
+            "You have reached the maximum number of tool calls. "
+            "Based on all the information you have gathered, provide your final response now. "
+            "Do not attempt to call any more tools."
+        )
     conversation_messages.append({"role": "user", "content": synthesis_prompt})
 
     # Truncate again — the per-iteration truncate ran before the last tool
@@ -716,17 +823,15 @@ async def execute_tool_loop(
             thinking_content=None,
             iterations=iteration + 1,
             hit_input_token_cap=hit_input_token_cap,
-            langfuse_run_handle=langfuse_run_handle,
-            capture_finalizer=_make_stream_capture_finalizer(
-                stream_telemetry, winning_plan, conversation_messages
-            ),
+            run_span=run_span,
+            hit_iteration_limit=True,
         )
 
     current_attempt.set(1)
 
     async def _final_call() -> HonchoLLMCallResponse[Any]:
         plan = get_attempt_plan()
-        return await honcho_llm_call_inner(
+        response = await honcho_llm_call_inner(
             plan.provider,
             plan.model,
             prompt,
@@ -740,7 +845,7 @@ async def execute_tool_loop(
             plan.thinking_budget_tokens,
             stream=False,
             client_override=plan.client,
-            tools=None,
+            tools=final_call_tools or None,
             tool_choice=None,
             messages=conversation_messages,
             selected_config=plan.selected_config,
@@ -749,27 +854,43 @@ async def execute_tool_loop(
                 telemetry, synthesis_iteration, step_seq=synthesis_iteration
             ),
         )
+        # No nudge follows synthesis, so an empty answer is a miss too.
+        _require_structured_answer(response, response_model, allow_empty=False)
+        return response
 
     if enable_retry:
         final_call_func = retry(
+            retry=retry_condition,
             stop=stop_after_attempt(retry_attempts),
             wait=wait_exponential(multiplier=1, min=4, max=10),
             before_sleep=before_retry_callback,
+            # Surface the provider's own error once the budget is spent.
+            # Without this tenacity raises RetryError, which erases the cause
+            # and lands every outage on the generic 500 handler.
+            reraise=True,
         )(_final_call)
     else:
         final_call_func = _final_call
 
-    # Step span around the synthesis call — same shape as in-loop iterations
-    # so the generation nests under the run root instead of dangling at the
-    # trace. Imperative pair with a try/finally for the .end().
-    synthesis_step = start_langfuse_agent_step(
-        _step_label(telemetry),
+    # Step span around the synthesis call, same shape as in-loop iterations.
+    synthesis_step = start_captured_span(
+        "step",
         _telemetry_for_iteration(
             telemetry, synthesis_iteration, step_seq=synthesis_iteration
         ),
     )
     try:
         final_response = await final_call_func()
+        if final_call_tools and final_response.tool_calls_made:
+            # Only the offered tools may run; anything else the model names is
+            # dropped rather than executed past the limit.
+            allowed = {t["name"] for t in final_call_tools}
+            set_current_iteration(synthesis_iteration)
+            await _execute_tool_calls(
+                [tc for tc in final_response.tool_calls_made if tc["name"] in allowed],
+                tool_executor,
+                all_tool_calls,
+            )
     finally:
         if synthesis_step is not None:
             synthesis_step.end()
@@ -798,6 +919,7 @@ async def execute_tool_loop(
     final_response.hit_input_token_cap = (
         final_response.hit_input_token_cap or hit_input_token_cap
     )
+    final_response.hit_iteration_limit = True
     return final_response
 
 

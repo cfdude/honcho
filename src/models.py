@@ -1,6 +1,7 @@
 import datetime
+import re
 from logging import getLogger
-from typing import Any, final
+from typing import Any, cast, final, override
 
 from dotenv import load_dotenv
 from nanoid import generate as generate_nanoid
@@ -23,7 +24,6 @@ from sqlalchemy import (
 from sqlalchemy.dialects.postgresql import JSONB, TEXT
 from sqlalchemy.orm import Mapped, MappedColumn, mapped_column, relationship
 from sqlalchemy.sql import func
-from typing_extensions import override
 
 from src.config import settings
 from src.utils.types import DocumentLevel, TaskType, VectorSyncState
@@ -90,12 +90,22 @@ session_peers_table = Table(
         ["peer_name", "workspace_name"],
         ["peers.name", "peers.workspace_name"],
     ),
+    # Lets the peer-sessions list start from the peer's rows instead of walking every session
+    Index(
+        "ix_session_peers_workspace_peer",
+        "workspace_name",
+        "peer_name",
+        "session_name",
+    ),
 )
 
 
 @final
 class Workspace(Base):
     __tablename__: str = "workspaces"
+    deleted_at: Mapped[datetime.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     id: Mapped[str] = mapped_column(TEXT, default=generate_nanoid, primary_key=True)
     name: Mapped[str] = mapped_column(TEXT, unique=True)
     created_at: Mapped[datetime.datetime] = mapped_column(
@@ -109,6 +119,10 @@ class Workspace(Base):
     )
     configuration: Mapped[dict[str, Any]] = mapped_column(
         JSONB, default=dict, server_default=text("'{}'::jsonb")
+    )
+    # Generation counter for the deletion lifecycle barrier
+    deletion_generation: Mapped[int] = mapped_column(
+        Integer, default=0, server_default=text("0")
     )
 
     sessions = relationship(
@@ -129,6 +143,9 @@ class Workspace(Base):
 @final
 class Peer(Base):
     __tablename__: str = "peers"
+    deleted_at: Mapped[datetime.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     id: Mapped[str] = mapped_column(TEXT, default=generate_nanoid, primary_key=True)
     name: Mapped[str] = mapped_column(TEXT, nullable=False)
     h_metadata: Mapped[dict[str, Any]] = mapped_column(
@@ -166,6 +183,9 @@ class Peer(Base):
 @final
 class Session(Base):
     __tablename__: str = "sessions"
+    deleted_at: Mapped[datetime.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     id: Mapped[str] = mapped_column(TEXT, primary_key=True, default=generate_nanoid)
     name: Mapped[str] = mapped_column(TEXT)
     is_active: Mapped[bool] = mapped_column(default=True, server_default=text("true"))
@@ -183,6 +203,10 @@ class Session(Base):
     )
     configuration: Mapped[dict[str, Any]] = mapped_column(
         JSONB, default=dict, server_default=text("'{}'::jsonb")
+    )
+    # Generation counter for the deletion lifecycle barrier
+    deletion_generation: Mapped[int] = mapped_column(
+        Integer, default=0, server_default=text("0")
     )
 
     workspace = relationship("Workspace", back_populates="sessions")
@@ -205,6 +229,9 @@ class Session(Base):
 @final
 class Message(Base):
     __tablename__: str = "messages"
+    deleted_at: Mapped[datetime.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     id: Mapped[int] = mapped_column(
         BigInteger, Identity(), primary_key=True, autoincrement=True
     )
@@ -265,6 +292,16 @@ class Message(Base):
             "ix_messages_content_gin",
             text("to_tsvector('english', content)"),
             postgresql_using="gin",
+        ),
+        # Trigram index so content ILIKE '%q%' in message search can use an index.
+        # Declared unconditionally, but migration 3e7a1c9d5b20 skips it when
+        # pg_trgm is missing, so autogenerate against such a database will keep
+        # proposing it; drop that op from the generated revision.
+        Index(
+            "ix_messages_content_trgm",
+            "content",
+            postgresql_using="gin",
+            postgresql_ops={"content": "gin_trgm_ops"},
         ),
     )
 
@@ -353,6 +390,10 @@ class Collection(Base):
     workspace_name: Mapped[str] = mapped_column(
         ForeignKey("workspaces.name"), nullable=False, index=True
     )
+    # Generation counter for the deletion lifecycle barrier
+    deletion_generation: Mapped[int] = mapped_column(
+        Integer, default=0, server_default=text("0")
+    )
 
     __table_args__ = (
         UniqueConstraint(
@@ -375,6 +416,10 @@ class Collection(Base):
     )
 
 
+# Shape of a document id; legacy linkage arrays occasionally hold other refs.
+SOURCE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{21}$")
+
+
 @final
 class Document(Base):
     __tablename__: str = "documents"
@@ -390,9 +435,6 @@ class Document(Base):
         Integer, nullable=False, server_default=text("1")
     )
     embedding: MappedColumn[Any] = mapped_column(Vector(_VECTOR_DIM), nullable=True)
-    source_ids: Mapped[list[str] | None] = mapped_column(
-        JSONB, nullable=True, server_default=text("NULL")
-    )
     created_at: Mapped[datetime.datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), index=True
     )
@@ -419,6 +461,83 @@ class Document(Base):
     )
 
     collection = relationship("Collection", back_populates="documents")
+
+    # selectin (not lazy) is required: async lazy-loads raise MissingGreenlet.
+    source_links: Mapped[list["DocumentSource"]] = relationship(
+        "DocumentSource",
+        order_by="DocumentSource.position",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+        lazy="selectin",
+    )
+
+    # Pre-document_sources linkage. Read-only: the reconciler drains it into
+    # document_sources and NULLs it; a follow-up migration drops the column.
+    legacy_source_ids: Mapped[list[str] | None] = mapped_column(
+        "source_ids", JSONB(none_as_null=True), nullable=True
+    )
+
+    @property
+    def source_ids(self) -> list[str] | None:
+        """Parent conclusion IDs in original order; None when unlinked.
+
+        Falls back to the legacy JSONB locations for rows the reconciler has
+        not drained yet, in the same precedence order as the drain.
+        """
+        if self.source_links:
+            return [link.source_id for link in self.source_links]
+        for candidate in (
+            self.legacy_source_ids,
+            self.internal_metadata.get("source_ids"),
+            self.internal_metadata.get("premise_ids"),
+        ):
+            if isinstance(candidate, list):
+                ids = [
+                    sid
+                    for sid in dict.fromkeys(cast(list[Any], candidate))
+                    if isinstance(sid, str) and SOURCE_ID_RE.match(sid)
+                ]
+                return ids or None
+        return None
+
+    @source_ids.setter
+    def source_ids(self, value: list[str] | None) -> None:
+        # Constructor convenience: kwargs apply in order, so workspace_name
+        # must be passed before source_ids. Dedupes (PK is (derived_id,
+        # source_id)); crud.build_source_links additionally drops malformed
+        # IDs from LLM output before they reach this point.
+        self.source_links = [
+            DocumentSource(
+                source_id=sid, position=i, workspace_name=self.workspace_name
+            )
+            for i, sid in enumerate(dict.fromkeys(value or []))
+        ]
+
+    # Messages the deriver cited as evidence for an explicit conclusion.
+    source_message_links: Mapped[list["ConclusionSourceMessage"]] = relationship(
+        "ConclusionSourceMessage",
+        order_by="ConclusionSourceMessage.position",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+        lazy="selectin",
+    )
+
+    @property
+    def source_message_ids(self) -> list[str] | None:
+        """Public ids of the cited messages in citation order; None when uncited."""
+        if self.source_message_links:
+            return [link.message_id for link in self.source_message_links]
+        return None
+
+    @source_message_ids.setter
+    def source_message_ids(self, value: list[str] | None) -> None:
+        # Same constructor ordering caveat as source_ids: workspace_name first.
+        self.source_message_links = [
+            ConclusionSourceMessage(
+                message_id=mid, position=i, workspace_name=self.workspace_name
+            )
+            for i, mid in enumerate(dict.fromkeys(value or []))
+        ]
 
     __table_args__ = (
         CheckConstraint("length(id) = 21", name="id_length"),
@@ -458,18 +577,83 @@ class Document(Base):
                 "embedding": "vector_cosine_ops"
             },  # Cosine distance operator
         ),
-        # GIN index for efficient tree traversal (finding children by source IDs)
-        Index(
-            "ix_documents_source_ids_gin",
-            "source_ids",
-            postgresql_using="gin",
-        ),
         # Composite index for efficient reconciliation queries
         Index(
             "ix_documents_sync_state_last_sync_at",
             "sync_state",
             "last_sync_at",
         ),
+        # Serves reverse traversal on undrained legacy rows; dropped with the
+        # column in the follow-up migration.
+        Index(
+            "ix_documents_source_ids_gin",
+            "source_ids",
+            postgresql_using="gin",
+        ),
+        # Rows the reconciler still has to drain; empty once the drain
+        # finishes. Dropped with the column in the follow-up migration.
+        Index(
+            "ix_documents_legacy_sources_pending",
+            "id",
+            postgresql_where=text(
+                "source_ids IS NOT NULL OR internal_metadata ?| ARRAY['source_ids', 'premise_ids']"  # noqa: E501
+            ),
+        ),
+    )
+
+
+@final
+class DocumentSource(Base):
+    """One reasoning-tree edge: derived_id was concluded from source_id."""
+
+    __tablename__: str = "document_sources"
+
+    derived_id: Mapped[str] = mapped_column(
+        ForeignKey("documents.id", ondelete="CASCADE"), primary_key=True
+    )
+    # Deliberately not an FK: the dreamer can emit IDs that never resolve,
+    # and sources may be deleted independently of their children.
+    source_id: Mapped[str] = mapped_column(TEXT, primary_key=True)
+    position: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default=text("0")
+    )
+    workspace_name: Mapped[str] = mapped_column(
+        ForeignKey("workspaces.name"), nullable=False
+    )
+
+    __table_args__ = (
+        # Reverse traversal ("who derived from me?") — replaces the old GIN index
+        Index("ix_document_sources_source_id", "source_id", "workspace_name"),
+        CheckConstraint("length(source_id) = 21", name="source_id_length"),
+        CheckConstraint("source_id ~ '^[A-Za-z0-9_-]+$'", name="source_id_format"),
+    )
+
+
+@final
+class ConclusionSourceMessage(Base):
+    """One evidence edge: conclusion_id cites message_id as evidence."""
+
+    __tablename__: str = "conclusion_source_messages"
+
+    conclusion_id: Mapped[str] = mapped_column(
+        ForeignKey("documents.id", ondelete="CASCADE"), primary_key=True
+    )
+    message_id: Mapped[str] = mapped_column(
+        ForeignKey("messages.public_id", ondelete="CASCADE"), primary_key=True
+    )
+    position: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default=text("0")
+    )
+    workspace_name: Mapped[str] = mapped_column(
+        ForeignKey("workspaces.name"), nullable=False
+    )
+
+    __table_args__ = (
+        Index(
+            "ix_conclusion_source_messages_message_id", "message_id", "workspace_name"
+        ),
+        CheckConstraint("length(message_id) = 21", name="message_id_length"),
+        CheckConstraint("message_id ~ '^[A-Za-z0-9_-]+$'", name="message_id_format"),
     )
 
 
@@ -525,6 +709,28 @@ class QueueItem(Base):
             "work_unit_key",
             unique=True,
             postgresql_where=text("task_type = 'dream' AND processed = false"),
+        ),
+        # Pending-work lookups by the peer or session a payload references.
+        # The observers index needs btree_gin for its workspace_name column.
+        Index(
+            "ix_queue_pending_observers",
+            "workspace_name",
+            text("(payload -> 'observers')"),
+            postgresql_using="gin",
+            postgresql_where=text(
+                "processed = false AND (payload -> 'observers') IS NOT NULL"
+            ),
+        ),
+        *(
+            Index(
+                f"ix_queue_pending_{key}",
+                "workspace_name",
+                text(f"(payload ->> '{key}')"),
+                postgresql_where=text(
+                    f"processed = false AND (payload ->> '{key}') IS NOT NULL"
+                ),
+            )
+            for key in ("observed", "observer", "scope_peer", "session_name")
         ),
     )
 

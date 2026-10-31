@@ -7,9 +7,60 @@ and this project adheres to [Semantic Versioning](http://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- `source_message_ids` on conclusion output: the messages an explicit conclusion cites as evidence (Honcho v3.4.0+; a count in table mode, the full list in JSON). `conclusion list --cites <message_id>` narrows to the conclusions that cite a message. Null in JSON on servers or SDKs that predate the field
+
+## [0.3.0] - 2026-10-23
+
+### Added
+
+- `honcho install` finds the AI agents on this machine, shows which already have Honcho, and offers a checkbox picker. Claude Code, Hermes Agent, OpenClaw and Pi get their Honcho plugin and Codex the Honcho MCP server and skill, each through the agent's own commands and the API key in `~/.honcho/config.json`. If that file has no `peerName` yet, it asks what agents should call you (default: your OS username) and saves it there for every agent to share. Other agents it finds link to their setup guide, and `honcho install grok-bot` copies a setup prompt for Grok Bot. Run from inside Claude Code or Codex, it sets up that agent without prompting. `honcho install all` or `honcho install <id>...` skips the picker; `--list` and `--json` only report
+
+### Security
+
+- Requires `certifi` 2026.10.19 or newer, the first CA bundle without the emSign root behind the compromised eMudhra intermediates. Upgrading the CLI now upgrades the bundle it verifies TLS with, including under `pip install -U`, which otherwise leaves dependencies alone
+- A local stack keeps the Honcho image it pinned on first `honcho start`, so a stack set up before this release can still be running an image with the old bundle. Move to the patched image with `honcho stop`, then `honcho start --image ghcr.io/plastic-labs/honcho:v3.4.1`; data is kept
+
+## [0.2.1] - 2026-10-20
+
 ### Fixed
 
-- `--setup` for openai-compatible writes `EMBEDDING_MODEL_CONFIG__OVERRIDES__BASE_URL` into the profile `.env` alongside `LLM_OPENAI_BASE_URL`
+- `honcho session summaries`, `honcho session inspect`, `honcho session context` and `honcho workspace queue-status` emit nested SDK objects (summaries, context messages, per-session queue status) as JSON objects instead of Python repr strings like `"content='...' message_id='...'"` (#1324)
+
+## [0.2.0] - 2026-09-21
+
+### Added
+
+- CLI requests carry `X-Honcho-Host: honcho-cli/<version> (<platform>)` so telemetry counts them as CLI traffic rather than direct SDK use (#1181)
+- Conclusion attribution on `honcho conclusion list` and `honcho conclusion search` (Honcho v3.2.0+): every row now carries `level`, `source_ids` and `times_derived`, so an extracted fact is distinguishable from a dreamed one. Table output shows a premise count; `--json` keeps the full id list, ready to pipe into `honcho conclusion get` (#952)
+- `honcho conclusion get <id>...` fetches conclusions by ID from anywhere in the workspace, with no observer/observed pair required. Feed it a conclusion's `source_ids` to walk a reasoning chain down to the explicit facts underneath it; IDs that no longer exist are reported rather than failing the command (#952)
+- `honcho conclusion derived <id>` lists what was built on top of a conclusion — the same edge walked upward. Worth checking before deleting or correcting a fact (#952)
+- `--level` on `honcho conclusion list` and `honcho conclusion search`, and `--derived-from` on `honcho conclusion list` (#952)
+- `--evidence` on `honcho peer chat` and `honcho workspace chat` (Honcho v3.2.0+): reports the conclusions and messages the dialectic read and the tools it called. Evidence is collated from what the agent accessed rather than reported by the model, so it over-reports and costs no extra model tokens. Messages are summarised per session, since evidence carries their identity but not their text (#1129)
+
+### Changed
+
+- Requires `honcho-ai` 2.5.0 (was 2.4.0), which carries the attribution fields and the evidence-bearing chat response
+
+## [0.1.5] - 2026-09-09
+
+### Added
+
+- `honcho scope` command group: `list`, `create`, `inspect`, `sessions`, `add-sessions`, `remove-session`, `status` (Honcho v3.1.0+) (#1162)
+- `honcho workspace chat` for reasoned questions across all peers (Honcho v3.1.0+) (#1150)
+- `--scope` on `honcho workspace chat` and `honcho peer chat`, and `--sessions` on `honcho peer chat`, to confine recall (Honcho v3.1.0+) (#1151)
+
+## [0.1.4] - 2026-08-26
+
+### Added
+
+- A TTY notice when a newer `honcho-cli` is on PyPI (`uv tool upgrade honcho-cli`). Skipped in JSON mode; disable with `HONCHO_NO_UPDATE_CHECK`
+
+### Fixed
+
+- `--setup` for openai-compatible writes `EMBEDDING_MODEL_CONFIG__OVERRIDES__BASE_URL` into the profile `.env` alongside `LLM_OPENAI_BASE_URL` (#1068)
+- `--setup` API key prompts echo `*` per character so a paste is visibly received instead of a blank getpass field
 
 ## [0.1.3] - 2026-08-25
 

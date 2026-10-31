@@ -1,4 +1,21 @@
 # .pre-commit-config.yaml
+# FORK: every local hook runs `uv run --frozen`, never bare `uv run`.
+#
+# Bare `uv run` REWRITES uv.lock here, and pre-commit then fails the hook with
+# "files were modified by this hook" even when the tool itself reported
+# "0 errors, 0 warnings". Worse, pre-commit's rollback restores the stash but NOT
+# the hook's own edit, so the rewritten lockfile is left in the working tree —
+# 2942 insertions / 2237 deletions on 2026-10-28, an unreviewed dependency change
+# one `git add -A` away from shipping to production.
+#
+# The trigger is upstream's `exclude-newer = "5 days"` in pyproject.toml, which is
+# not valid for uv (it wants an RFC 3339 timestamp or date). uv cannot parse it,
+# concludes the timestamp cutoff was REMOVED, and re-resolves:
+#   "Ignoring existing lockfile due to removal of timestamp cutoff"
+# --frozen makes that impossible regardless of whether upstream ever fixes the line.
+#
+# This is also the root cause of the long-standing "uv run rewrites uv.lock" gotcha
+# recorded in honcho-deploy/docs/server-repo-dev-gotchas.md.
 repos:
   # Secret scanning. REQUIRED: `pre-commit install` overwrites
   # .git/hooks/pre-commit and destroys the `git secrets` hook that
@@ -32,15 +49,15 @@ repos:
 
   # Python code formatting and linting with ruff
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.8.4
+    rev: v0.15.12
     hooks:
       # Linter - only on Python directories
-      - id: ruff
+      - id: ruff-check
         args: [--fix]
-        files: ^(src/|tests/|scripts/|migrations/|sdks/python/).*\.py$
+        files: ^(src/|tests/|scripts/|migrations/|sdks/python/|sandbox/).*\.py$
       # Formatter - only on Python directories
       - id: ruff-format
-        files: ^(src/|tests/|scripts/|migrations/|sdks/python/).*\.py$
+        files: ^(src/|tests/|scripts/|migrations/|sdks/python/|sandbox/).*\.py$
 
   # Security checks - only on main src code (not tests/scripts)
   - repo: https://github.com/PyCQA/bandit
@@ -64,7 +81,7 @@ repos:
       # Type checking with basedpyright - only on main Python code
       - id: basedpyright
         name: basedpyright
-        entry: uv run basedpyright
+        entry: uv run --frozen basedpyright
         language: system
         files: ^(src/|tests/|sdks/python/|scripts/).*\.py$
         require_serial: true
@@ -73,7 +90,7 @@ repos:
       # Run main application tests
       - id: pytest-main
         name: pytest (main app)
-        entry: uv run pytest -x tests/ --ignore=tests/alembic/
+        entry: uv run --frozen pytest -x tests/ --ignore=tests/alembic/
         language: system
         files: ^(src/|tests/).*\.py$
         stages: [pre-push]
@@ -82,7 +99,7 @@ repos:
       # Run Alembic tests only when migrations change
       - id: pytest-alembic
         name: pytest (alembic migrations)
-        entry: uv run python scripts/run_alembic_tests.py
+        entry: uv run --frozen python scripts/run_alembic_tests.py
         language: system
         files: ^(migrations/versions/.*\.py|tests/alembic/.*\.py)$
         stages: [pre-push]
@@ -92,9 +109,18 @@ repos:
       # Ensure each alembic migration revision has a corresponding test file
       - id: ensure-alembic-coverage
         name: ensure alembic migration test coverage
-        entry: uv run python scripts/ensure_alembic_tests.py
+        entry: uv run --frozen python scripts/ensure_alembic_tests.py
         language: system
         files: ^(migrations/versions/.*\.py|tests/alembic/revisions/.*\.py)$
+        stages: [pre-push]
+        pass_filenames: false
+
+      # Ensure the alembic migration graph has a single head
+      - id: check-alembic-heads
+        name: check alembic migrations have a single head
+        entry: uv run --frozen python scripts/check_alembic_heads.py
+        language: system
+        files: ^migrations/versions/.*\.py$
         stages: [pre-push]
         pass_filenames: false
 
@@ -107,7 +133,16 @@ repos:
         stages: [pre-push]
         pass_filenames: false
 
-      # TypeScript build with bun (tests run via pytest)
+      # TypeScript SDK tests against a throwaway API + mock LLM provider
+      - id: typescript-sdk-tests
+        name: TypeScript SDK tests
+        entry: bash -c 'cd sdks/typescript && bun run test'
+        language: system
+        files: ^(sdks/typescript/(src|__tests__)/.*\.ts|scripts/run_ts_sdk_tests\.py)$
+        stages: [pre-push]
+        pass_filenames: false
+
+      # TypeScript build with bun
       - id: typescript-check
         name: TypeScript build
         entry: bash -c 'if [ -f "sdks/typescript/package.json" ]; then cd sdks/typescript && bun run build; fi'
@@ -131,6 +166,14 @@ repos:
       - id: markdownlint
         args: ['--fix']
         files: \.(md|mdx)$
+        # FORK: generated files are excluded. `openspec update` owns
+        # .claude/skills/openspec-*/ and .claude/commands/opsx/ and rewrites them
+        # in place from upstream templates, so --fix here is worse than useless:
+        # it edits files we do not author, the edits are destroyed on the next
+        # regeneration, and in the meantime they diverge from the template. One
+        # regeneration arrived carrying 4 MD036/MD033 violations and --fix wrote
+        # 47 lines into seven files, blocking the commit either way.
+        exclude: ^\.claude/(skills/openspec-|commands/opsx/)
 
   # Commit message linting
   - repo: https://github.com/commitizen-tools/commitizen

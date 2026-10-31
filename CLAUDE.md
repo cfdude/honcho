@@ -2,6 +2,8 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+**Before opening a PR or filing an issue**, read [If you're an agent](CONTRIBUTING.md#if-youre-an-agent) in `CONTRIBUTING.md`. Pull requests are limited to maintainers (write access); everyone else files an issue. Issues follow [Filing an issue](CONTRIBUTING.md#filing-an-issue).
+
 # Honcho Overview
 
 ## What is Honcho?
@@ -82,6 +84,7 @@ All API routes follow the pattern: `/v3/{resource}/{id}/{action}`. Most "list/se
 - Run server: `uv run fastapi dev src/main.py`
 - Run tests: `uv run pytest tests/`
 - Run single test: `uv run pytest tests/path/to/test_file.py::test_function`
+- Reproduce an API bug (5xx, wrong status) as a property test: see the `property-repro` skill (`skills/property-repro/`)
 - Linting: `uv run ruff check src/`
 - Typechecking: `uv run basedpyright`
 - Format code: `uv run ruff format src/`
@@ -90,15 +93,11 @@ All API routes follow the pattern: `/v3/{resource}/{id}/{action}`. Most "list/se
 
 #### TypeScript SDK
 
-**🚨 DO NOT RUN `bun test` DIRECTLY. IT WILL NOT WORK. 🚨**
-
-The TypeScript SDK tests require a running Honcho server with database and Redis. Running `bun test` alone will fail immediately because there's no server. The tests are orchestrated via pytest which handles all the infrastructure setup.
-
-**The ONLY way to run TypeScript SDK tests:**
+The TypeScript SDK tests run against a real Honcho server. `bun run test` (not bare `bun test`, which has no server to talk to) starts one for them: `scripts/run_ts_sdk_tests.py` creates a throwaway database on the Postgres named by `DB_CONNECTION_URI`, migrates it, starts the API and the mock LLM provider (`src/mock_provider`), runs `bun test`, and tears it all down. No provider key is needed. They are not part of `uv run pytest`.
 
 ```bash
-# From the monorepo root (not from sdks/typescript/)
-uv run pytest tests/ -k typescript
+cd sdks/typescript && bun run test             # whole suite
+cd sdks/typescript && bun run test peer.test   # bun test args pass through
 ```
 
 **To type-check the TypeScript SDK (this is fine to run directly):**
@@ -118,7 +117,19 @@ cd sdks/typescript && bun run tsc --noEmit
 - **Never hold a DB session during external calls** (LLM, embedding, HTTP). If a function needs both a DB session and an external call result, compute the external result first and pass it as a parameter. This avoids tying up DB connections during slow network I/O. Use `tracked_db` for short-lived, DB-only operations; pass a shared session when multiple DB-only calls can reuse one connection.
 - **Never write through a read-only session** (`tracked_db(..., read_only=True)`, `get_read_db`, `ReadSessionLocal`). These run in AUTOCOMMIT mode with no transaction: writes are NOT blocked by the database — they silently commit immediately, and `begin_nested()` savepoints break. There is no runtime guard; this is enforced by convention only. Use `read_only=True` strictly for SELECT-only windows; anything that mutates (including get-or-create paths) must use a regular write session.
 
+#### Multi-row locking and deadlocks
+
+Tables written concurrently by more than one worker — `documents` (deriver, dreamer, scope backfill/removal, reconciler) and `queue` (every deriver replica) — deadlock when two writers touch an overlapping row set in different orders. Rules:
+
+- **A multi-row `SELECT ... FOR UPDATE` MUST carry an explicit `ORDER BY <pk>`.** Without it Postgres locks in scan order, which differs per plan, so two writers with overlapping sets can cycle. `_apply_document_row_updates` in `src/crud/document.py` is the reference implementation.
+- **`WHERE id IN (...)` does NOT impose an order**, so sorting the Python list is a no-op — the list order is discarded and the planner picks `Bitmap Heap Scan` (ctid order), `Index Scan` (id order), or `Seq Scan` per invocation. Deterministic ordering requires either a preceding `SELECT ... ORDER BY id FOR UPDATE` or `WHERE id IN (SELECT id ... ORDER BY id FOR UPDATE)`.
+- **`Document.id` is a random nanoid** (`models.py`), so id order is uncorrelated with physical order — an unordered predicate `UPDATE`/`DELETE` is roughly a coin flip against an id-ordered locker per row pair, not a rare edge case. (`QueueItem.id` is an integer identity, so there id order is also chronological.)
+- **Prefer no lock at all.** A single `UPDATE ... WHERE <predicate>` acquires row locks as it writes and has no separate lock phase to get wrong. Reach for `FOR UPDATE` only when a value must be read, computed in Python, and written back — that read-modify-write is the only reason `_apply_document_row_updates` locks (it replaced a server-side `func.greatest()`), and `populate_existing=True` is required with it so the identity map doesn't serve a stale pre-lock value. Server-side expressions (`func.greatest`, the JSONB `-` operator) avoid the lock entirely; see `_clear_work_unit_retry_attempts` in `src/deriver/queue_manager.py`.
+- `FOR UPDATE SKIP LOCKED` (the reconciler's claim pattern) never waits, so it cannot be a deadlock partner — but holding those locks across an external call still stalls other writers. See the "never hold a DB session during external calls" rule above.
+
 #### Auth scoping
+
+- **Named-scope keys (`sc` plus `w`) require explicit `allow_scope=True` on supported routes.** This grants both recall and ingestion within that scope, not peer-member write access. Recall handlers must bind their projection to the token; session routes check active scope membership. Keep the named-scope route allowlist in `tests/routes/test_auth_route_policy.py` synchronized. Never allow restricted keys to enroll unrelated existing sessions or fall back to global recall.
 
 - **`allow_member_read=True` (in `require_auth(...)`) is read-only — NEVER set it on a route that mutates state.** It lets a peer-scoped key reach a session route when its peer is an active member of the session, so on a mutating route it would hand any session member write access (message injection, config mutation, deletion). HTTP method is not a reliable read/write signal here (some read routes use POST for a richer body), so this is enforced by an explicit allowlist in `tests/routes/test_auth_route_policy.py` — adding the flag to a new route fails that test until you consciously add the route to `EXPECTED_MEMBER_READ_ROUTES`, and you must never add a mutating method there.
 - **When a member-read route is keyed by another sub-resource** (e.g. `peers/{peer_id}/config`), the handler must additionally confirm a peer-scoped caller only reads its OWN resource (`jwt_params.p == peer_id`, else raise `AuthenticationException`). Membership grants session access, not access to a co-member's data. See `get_peer_config` in `src/routers/sessions.py`.
@@ -260,6 +271,7 @@ src/
 │   ├── representation.py # Representation formatting (distinct from crud/representation.py)
 │   ├── search.py, filter.py, formatting.py
 │   ├── tokens.py         # tiktoken-based counting
+│   ├── pagination.py     # List pagination: opt-in cursor mode + the cached offset shim
 │   ├── work_unit.py, queue_payload.py
 │   ├── config_helpers.py, json_parser.py, files.py
 │   └── types.py
@@ -279,6 +291,7 @@ src/
 - Token counting on messages for usage tracking
 - JSONB metadata fields for extensibility
 - HNSW indexes for vector similarity search
+- **A `Select` that feeds a list endpoint MUST have a total ORDER BY ending in a unique column** (e.g. `created_at, id`). `paginate_offset_or_cursor` (`src/utils/pagination.py`) seeks by the sort key in both cursor mode and the offset shim; without a unique tail, rows that share a sort key are skipped or repeated across pages.
 
 ### Key Architectural Decisions
 
@@ -288,7 +301,7 @@ src/
 4. **"Minimal" deriver**: memory formation is a single structured-output LLM call per batch, not an agentic tool loop. Predictable cost, lower latency. The Dialectic is the one true tool-using agent.
 5. **Provider-agnostic LLM layer** (`src/llm/`): all model calls go through `honcho_llm_call()`. Backends (`anthropic`, `gemini`, `openai`) sit behind a registry; per-agent `MODEL_CONFIG` with fallback chains is resolved at call time.
 6. **Dialectic reasoning tiers**: 5 levels (`minimal` → `max`); each level has its own model config and tool set (`minimal` uses a reduced toolset).
-7. **Hybrid search**: Postgres FTS (GIN index on `to_tsvector('english', content)`) + vector similarity (HNSW on `MessageEmbedding.embedding`). `MessageEmbedding` is a separate table from `Message` with its own `sync_state` so embedding is decoupled from message creation.
+7. **Hybrid search**: Postgres FTS (GIN index on `to_tsvector('english', content)`, OR'd with a `content ILIKE` fallback backed by a `pg_trgm` GIN index; without pg_trgm the index is skipped and the ILIKE scans) + vector similarity (HNSW on `MessageEmbedding.embedding`). `MessageEmbedding` is a separate table from `Message` with its own `sync_state` so embedding is decoupled from message creation.
 8. **Pluggable external vector stores**: defaults to pgvector inline; can swap to turbopuffer or lancedb (`VECTOR_STORE_*` config; `src/vector_store/`).
 9. **Composite-FK multi-tenancy**: `workspace_name` participates in nearly every composite FK. Cross-workspace data leakage is structurally impossible at the schema level.
 10. **Scoped Authentication**: JWTs can be scoped to workspace, peer, or session level.

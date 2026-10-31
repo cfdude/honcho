@@ -15,6 +15,8 @@ echo "Running database migrations..."
 /app/.venv/bin/python scripts/provision_db.py
 
 echo "Starting API server..."
-# Bind IPv6 (dual-stack) so the app is reachable over Railway's private network,
-# which is IPv6 (fd12::/16). A 0.0.0.0 (IPv4-only) bind is unreachable there.
-exec /app/.venv/bin/fastapi run --host :: src/main.py
+# FORK: bind IPv6 (dual-stack) so the app is reachable over Railway's private
+# network, which is IPv6 (fd12::/16). A 0.0.0.0 (IPv4-only) bind is unreachable
+# there, so upstream's host must not be taken. --workers IS upstream's and is
+# kept: it defaults to 1, which is today's behavior.
+exec /app/.venv/bin/fastapi run --host :: --workers "${API_WORKERS:-1}" src/main.py

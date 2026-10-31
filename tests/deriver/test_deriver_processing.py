@@ -1,5 +1,6 @@
 import signal
-from datetime import datetime, timezone
+from collections.abc import Callable
+from datetime import UTC, datetime
 from typing import Any
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -9,7 +10,7 @@ from src import crud, models
 from src.config import settings
 from src.crud.representation import RepresentationManager
 from src.deriver.deriver import process_representation_tasks_batch
-from src.exceptions import RepresentationSaveError
+from src.exceptions import EmptyRepresentationError, RepresentationSaveError
 from src.llm import HonchoLLMCallResponse
 from src.utils.representation import (
     ExplicitObservationBase,
@@ -23,6 +24,82 @@ from src.utils.work_unit import construct_work_unit_key, parse_work_unit_key
 class TestDeriverProcessing:
     """Test suite for deriver processing using the conftest fixtures"""
 
+    async def test_cited_indices_resolve_to_batch_public_ids(self):
+        """source_indices are batch positions; the saved observation carries the
+        public ids of those messages, including a non-target context message."""
+
+        def _message(row_id: int, public_id: str, peer: str) -> Mock:
+            return Mock(
+                id=row_id,
+                public_id=public_id,
+                session_name="session-1",
+                workspace_name="workspace-1",
+                peer_name=peer,
+                content="...",
+                token_count=5,
+                created_at=datetime.now(UTC),
+            )
+
+        messages: list[Any] = [
+            _message(10, "bob_asks_______000010", "bob"),
+            _message(20, "alice_picks____000020", "alice"),
+            _message(30, "bob_acks_______000030", "bob"),
+        ]
+        configuration = Mock()
+        configuration.reasoning.enabled = True
+        configuration.dream.enabled = False
+        configuration.reasoning.custom_instructions = None
+        configuration.reasoning.custom_instructions_source = None
+
+        mock_response = HonchoLLMCallResponse(
+            content=PromptRepresentation(
+                explicit=[
+                    ExplicitObservationBase(
+                        source_indices=[1, 0, 7], content="alice chose SQLite"
+                    )
+                ]
+            ),
+            input_tokens=10,
+            output_tokens=5,
+            finish_reasons=["STOP"],
+        )
+        saved: list[Representation] = []
+
+        async def capture_save(
+            _self: RepresentationManager,
+            observations: Representation,
+            *_args: Any,
+            **_kwargs: Any,
+        ) -> crud.CreateDocumentsResult:
+            saved.append(observations)
+            return crud.CreateDocumentsResult()
+
+        with (
+            patch(
+                "src.deriver.deriver.honcho_llm_call",
+                new_callable=AsyncMock,
+                return_value=mock_response,
+            ),
+            patch.object(RepresentationManager, "save_representation", capture_save),
+        ):
+            await process_representation_tasks_batch(
+                messages=messages,
+                message_level_configuration=configuration,
+                observers=["bob"],
+                observed="alice",
+                queue_item_message_ids=[20],
+                session_id="canonical-session-1",
+            )
+
+        assert len(saved) == 1
+        observation = saved[0].explicit[0]
+        assert observation.message_ids == [20]
+        # Citation order is preserved; the out-of-range index is dropped.
+        assert observation.source_message_ids == [
+            "alice_picks____000020",
+            "bob_asks_______000010",
+        ]
+
     async def test_process_representation_tasks_batch_uses_model_config(self):
         message = Mock(
             id=1,
@@ -32,10 +109,12 @@ class TestDeriverProcessing:
             peer_name="alice",
             content="hello",
             token_count=5,
-            created_at=datetime.now(timezone.utc),
+            created_at=datetime.now(UTC),
         )
         configuration = Mock()
         configuration.reasoning.enabled = True
+        configuration.reasoning.custom_instructions = None
+        configuration.reasoning.custom_instructions_source = None
 
         mock_response = HonchoLLMCallResponse(
             content=PromptRepresentation(explicit=[]),
@@ -55,6 +134,7 @@ class TestDeriverProcessing:
                 observers=["bob"],
                 observed="alice",
                 queue_item_message_ids=[1],
+                session_id="canonical-session-1",
             )
 
         await_args = mock_llm_call.await_args
@@ -72,6 +152,117 @@ class TestDeriverProcessing:
         assert kwargs["model_config"].stop_sequences == expected_config.stop_sequences
         assert "llm_settings" not in kwargs
 
+    @staticmethod
+    async def _deriver_response_hook(
+        peer_name: str = "alice",
+        content: str = "hello",
+    ) -> Callable[[HonchoLLMCallResponse[Any]], None]:
+        """Run one batch and return the validate_response hook it passed."""
+        message = Mock(
+            id=1,
+            public_id="msg_1",
+            session_name="session-1",
+            workspace_name="workspace-1",
+            peer_name=peer_name,
+            content=content,
+            token_count=5,
+            created_at=datetime.now(UTC),
+        )
+        configuration = Mock()
+        configuration.reasoning.enabled = True
+        configuration.reasoning.custom_instructions = None
+        configuration.reasoning.custom_instructions_source = None
+
+        with patch(
+            "src.deriver.deriver.honcho_llm_call",
+            new_callable=AsyncMock,
+            return_value=HonchoLLMCallResponse(
+                content=PromptRepresentation(explicit=[]),
+                output_tokens=5,
+                finish_reasons=["stop"],
+            ),
+        ) as mock_llm_call:
+            await process_representation_tasks_batch(
+                messages=[message],
+                message_level_configuration=configuration,
+                observers=["bob"],
+                observed="alice",
+                queue_item_message_ids=[1],
+                session_id="canonical-session-1",
+            )
+
+        await_args = mock_llm_call.await_args
+        assert await_args is not None
+        return await_args.kwargs["validate_response"]
+
+    @pytest.mark.parametrize(
+        ("content", "finish_reason", "parse_class"),
+        [
+            (PromptRepresentation(explicit=[]), "length", "truncated"),
+            (PromptRepresentation(explicit=[]), "max_tokens", "truncated"),
+            (PromptRepresentation(explicit=[]), "content_filter", "content_filtered"),
+            # An OpenAI refusal arrives as its text instead of the model.
+            ("I can't help with that.", "stop", "content_filtered"),
+        ],
+    )
+    async def test_degraded_empty_representation_is_refused(
+        self, content: object, finish_reason: str, parse_class: str
+    ):
+        """The deriver's hook refuses a truncated, filtered, or refused empty,
+        carrying the prompt's digest but none of its text."""
+        secret = "my-sentinel-secret-4417"
+        validate = await self._deriver_response_hook(content=f"my password is {secret}")
+
+        with pytest.raises(EmptyRepresentationError) as exc_info:
+            validate(
+                HonchoLLMCallResponse(
+                    content=content, output_tokens=4096, finish_reasons=[finish_reason]
+                )
+            )
+
+        exc = exc_info.value
+        assert exc.parse_class == parse_class
+        assert exc.prompt_digest in str(exc)
+        assert secret not in str(exc)
+
+    @pytest.mark.parametrize(
+        "response",
+        [
+            # Zero output tokens is not a degradation signal: backends report 0
+            # when the provider omits usage.
+            HonchoLLMCallResponse(
+                content=PromptRepresentation(explicit=[]),
+                output_tokens=0,
+                finish_reasons=["stop"],
+            ),
+            HonchoLLMCallResponse(
+                content=PromptRepresentation(
+                    explicit=[ExplicitObservationBase(content="Has a dog")]
+                ),
+                output_tokens=4096,
+                finish_reasons=["length"],
+            ),
+        ],
+    )
+    async def test_clean_or_salvaged_representation_is_accepted(
+        self, response: HonchoLLMCallResponse[Any]
+    ):
+        """A clean-stop empty is an honest "nothing to record", and a
+        truncated response that still yielded observations keeps them."""
+        validate = await self._deriver_response_hook()
+        validate(response)
+
+    async def test_hook_accepts_anything_with_no_observed_messages(self):
+        """With no messages from the observed peer there is nothing to lose."""
+        validate = await self._deriver_response_hook(peer_name="bob")
+        validate(
+            HonchoLLMCallResponse(
+                content=PromptRepresentation(explicit=[]),
+                output_tokens=4096,
+                finish_reasons=["length"],
+            )
+        )
+
     async def test_all_observer_saves_failing_surfaces_failure(self):
         """When every observer's save_representation fails, the batch must raise."""
         message = Mock(
@@ -82,10 +273,12 @@ class TestDeriverProcessing:
             peer_name="alice",
             content="hello",
             token_count=5,
-            created_at=datetime.now(timezone.utc),
+            created_at=datetime.now(UTC),
         )
         configuration = Mock()
         configuration.reasoning.enabled = True
+        configuration.reasoning.custom_instructions = None
+        configuration.reasoning.custom_instructions_source = None
 
         mock_response = HonchoLLMCallResponse(
             content=PromptRepresentation(
@@ -116,6 +309,7 @@ class TestDeriverProcessing:
                 observers=["bob"],
                 observed="alice",
                 queue_item_message_ids=[1],
+                session_id="canonical-session-1",
             )
 
         # Telemetry must fire *before* the raise so a total save failure is still
@@ -136,10 +330,12 @@ class TestDeriverProcessing:
             peer_name="alice",
             content="hello",
             token_count=5,
-            created_at=datetime.now(timezone.utc),
+            created_at=datetime.now(UTC),
         )
         configuration = Mock()
         configuration.reasoning.enabled = True
+        configuration.reasoning.custom_instructions = None
+        configuration.reasoning.custom_instructions_source = None
 
         mock_response = HonchoLLMCallResponse(
             content=PromptRepresentation(
@@ -175,12 +371,71 @@ class TestDeriverProcessing:
                 observers=["bob", "carol"],
                 observed="alice",
                 queue_item_message_ids=[1],
+                session_id="canonical-session-1",
             )
 
         assert emitted, "expected a telemetry event to be emitted"
         event = emitted[-1]
         assert event.observer_count == 1
         assert event.failed_observer_count == 1
+
+    async def test_retryable_observer_save_reraises_after_telemetry(self):
+        """A deadlock on one observer must propagate so the queue can retry."""
+        from sqlalchemy.exc import OperationalError
+
+        class FakePGError(Exception):
+            sqlstate: str = "40P01"
+
+        deadlock = OperationalError("UPDATE documents", {}, FakePGError())
+        message = Mock(
+            id=1,
+            public_id="msg_1",
+            session_name="session-1",
+            workspace_name="workspace-1",
+            peer_name="alice",
+            content="hello",
+            token_count=5,
+            created_at=datetime.now(UTC),
+        )
+        configuration = Mock()
+        configuration.reasoning.enabled = True
+        configuration.reasoning.custom_instructions = None
+        configuration.reasoning.custom_instructions_source = None
+
+        mock_response = HonchoLLMCallResponse(
+            content=PromptRepresentation(
+                explicit=[
+                    ExplicitObservationBase(content="The user has a dog named Rover")
+                ]
+            ),
+            input_tokens=10,
+            output_tokens=5,
+            finish_reasons=["STOP"],
+        )
+        partial_save = AsyncMock(side_effect=[crud.CreateDocumentsResult(), deadlock])
+        emitted: list[Any] = []
+        with (
+            patch(
+                "src.deriver.deriver.honcho_llm_call",
+                new_callable=AsyncMock,
+                return_value=mock_response,
+            ),
+            patch.object(RepresentationManager, "save_representation", partial_save),
+            patch("src.deriver.deriver.emit", side_effect=emitted.append),
+            pytest.raises(OperationalError),
+        ):
+            await process_representation_tasks_batch(
+                messages=[message],
+                message_level_configuration=configuration,
+                observers=["bob", "carol"],
+                observed="alice",
+                queue_item_message_ids=[1],
+                session_id="canonical-session-1",
+            )
+
+        assert emitted, "expected telemetry to be emitted before the raised failure"
+        assert emitted[-1].observer_count == 1
+        assert emitted[-1].failed_observer_count == 1
 
     async def test_process_representation_tasks_batch_passes_custom_instructions_into_prompt(
         self,
@@ -193,10 +448,12 @@ class TestDeriverProcessing:
             peer_name="alice",
             content="hello",
             token_count=5,
-            created_at=datetime.now(timezone.utc),
+            created_at=datetime.now(UTC),
         )
         configuration = Mock()
         configuration.reasoning.enabled = True
+        configuration.reasoning.custom_instructions = None
+        configuration.reasoning.custom_instructions_source = None
         configuration.reasoning.custom_instructions = (
             "Prefer explicit facts with dates."
         )
@@ -229,6 +486,7 @@ class TestDeriverProcessing:
                 observers=["bob"],
                 observed="alice",
                 queue_item_message_ids=[1],
+                session_id="canonical-session-1",
             )
 
         mock_estimate_prompt_tokens.assert_called_once_with(
@@ -343,10 +601,12 @@ class TestDeriverProcessing:
             peer_name="alice",
             content="hello",
             token_count=100,
-            created_at=datetime.now(timezone.utc),
+            created_at=datetime.now(UTC),
         )
         configuration = Mock()
         configuration.reasoning.enabled = True
+        configuration.reasoning.custom_instructions = None
+        configuration.reasoning.custom_instructions_source = None
 
         mock_response = HonchoLLMCallResponse(
             content=PromptRepresentation(explicit=[]),
@@ -369,6 +629,7 @@ class TestDeriverProcessing:
                 observers=["bob"],
                 observed="alice",
                 queue_item_message_ids=[1],
+                session_id="canonical-session-1",
             )
 
         assert any(
@@ -394,10 +655,12 @@ class TestDeriverProcessing:
             peer_name="alice",
             content="hello",
             token_count=5,
-            created_at=datetime.now(timezone.utc),
+            created_at=datetime.now(UTC),
         )
         configuration = Mock()
         configuration.reasoning.enabled = True
+        configuration.reasoning.custom_instructions = None
+        configuration.reasoning.custom_instructions_source = None
 
         mock_response = HonchoLLMCallResponse(
             content=PromptRepresentation(explicit=[]),
@@ -424,6 +687,7 @@ class TestDeriverProcessing:
                 observers=["bob"],
                 observed="alice",
                 queue_item_message_ids=[1],
+                session_id="canonical-session-1",
             )
 
         assert any(
@@ -443,10 +707,12 @@ class TestDeriverProcessing:
             peer_name="alice",
             content="hello",
             token_count=5,
-            created_at=datetime.now(timezone.utc),
+            created_at=datetime.now(UTC),
         )
         configuration = Mock()
         configuration.reasoning.enabled = True
+        configuration.reasoning.custom_instructions = None
+        configuration.reasoning.custom_instructions_source = None
 
         mock_response = HonchoLLMCallResponse(
             content=PromptRepresentation(
@@ -494,6 +760,7 @@ class TestDeriverProcessing:
                 observers=["bob", "carol"],
                 observed="alice",
                 queue_item_message_ids=[1],
+                session_id="canonical-session-1",
             )
 
         assert len(emitted) == 1

@@ -2,7 +2,7 @@
 # https://testdriven.io/blog/docker-best-practices/
 FROM python:3.13-slim-bookworm
 
-COPY --from=ghcr.io/astral-sh/uv:0.9.24 /uv /bin/uv
+COPY --from=ghcr.io/astral-sh/uv:0.13.5 /uv /bin/uv
 
 # Set Working directory
 WORKDIR /app

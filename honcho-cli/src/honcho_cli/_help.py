@@ -24,6 +24,7 @@ from typer.core import TyperGroup
 from honcho_cli import __version__
 from honcho_cli.branding import BANNER, BRAND
 from honcho_cli.output import use_json
+from honcho_cli.update_check import maybe_print_update_nag
 
 
 # Theme Typer's rich help renderer. Module-level side effect limited to
@@ -69,6 +70,7 @@ def print_welcome(console: Console) -> None:
         ("honcho init",                  "configure API key and server URL"),
         ("honcho start [--setup basic]", "run a local Honcho stack (Docker)"),
         ("honcho doctor",                "verify connection and workspace health"),
+        ("honcho install",               "find your AI agents and add Honcho to them"),
     ]
     stack_rows = [
         ("honcho start / status / stop",          "lifecycle for the local Docker stack"),
@@ -79,30 +81,35 @@ def print_welcome(console: Console) -> None:
         ("[dim]pattern[/dim]", r"[dim]honcho <command> \[args] \[-w workspace] \[-p peer] \[-s session][/dim]"),
         ("[dim]example[/dim]", "[dim]honcho peer chat \"what does alice prefer?\" -p alice -w agents[/dim]"),
         ("", ""),
-        ("workspace",  "list · create · search · delete · inspect · queue-status"),
+        ("workspace",  "list · create · search · chat · delete · inspect · queue-status"),
         ("peer",       "list · create · search · inspect · card · chat"),
         ("",           "get-metadata · set-metadata · representation"),
         ("session",    "list · create · search · delete · inspect · view · add-peers"),
         ("",           "context · get-metadata · set-metadata · peers"),
         ("",           "remove-peers · representation · summaries"),
+        ("scope",      "list · create · inspect · sessions · add-sessions"),
+        ("",           "remove-session · status"),
         ("message",    "list · create · get"),
         ("conclusion", "list · create · search · delete"),
         ("config",     "inspect current configuration"),
     ]
     memory_rows = [
+        ("honcho workspace chat \"...\" -w <workspace>", "query the Dialectic across all peers"),
         ("honcho peer chat \"...\" -p <peer> -w <workspace>", "query the Dialectic about a peer"),
         ("honcho peer inspect -p <peer> -w <workspace>", "dashboard: peer card + recent conclusions + configuration"),
         ("honcho peer representation -p <peer> -w <workspace>", "global peer representation"),
         ("honcho peer representation -p <peer> -w <workspace> -s <session>", "session-scoped peer representation"),
+        ("honcho scope list -w <workspace>", "which session sets exist; inspect one for members + backfill"),
+        ("honcho peer chat \"...\" -p <peer> --scope <scope>", "answer from one scope's sessions only"),
         ("honcho peer card -p <peer> -w <workspace>", "synthesized identity: traits, preferences, instructions"),
         ("honcho conclusion list -p <peer> -w <workspace>", "browse peer conclusions"),
         ("honcho session view / context -s <session>", "transcript, or what an agent would see"),
         ("honcho workspace queue-status", "is the deriver processing?"),
     ]
     option_rows = [
-        ("-w / --workspace", "scope to a workspace"),
-        ("-p / --peer",      "scope to a peer"),
-        ("-s / --session",   "scope to a session"),
+        ("-w / --workspace", "target a workspace"),
+        ("-p / --peer",      "target a peer"),
+        ("-s / --session",   "target a session"),
         ("--json",           "force JSON output for scripts and agents"),
         ("--help",           "show help for any command (e.g. honcho peer --help)"),
     ]
@@ -113,6 +120,7 @@ def print_welcome(console: Console) -> None:
     console.print(_welcome_panel("memory", memory_rows))
     console.print(_welcome_panel("options", option_rows))
     console.print()
+    maybe_print_update_nag()
 
 
 class HonchoTyperGroup(TyperGroup):

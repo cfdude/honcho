@@ -28,15 +28,18 @@ import logging
 from dataclasses import dataclass
 from typing import Any
 
-from sqlalchemy import select, update
+from nanoid import generate as generate_nanoid
+from sqlalchemy import delete, exists, insert, or_, select, update
 from sqlalchemy.dialects.postgresql import array
+from sqlalchemy.orm import load_only
 from sqlalchemy.sql.functions import func
 
 from src import crud, models
 from src.config import settings
+from src.crud.document import build_source_message_links
 from src.crud.scope import ScopeBackfillState
-from src.crud.session import is_peer_in_session
 from src.dependencies import tracked_db
+from src.dreamer.working_memory import EPOCH_KEY, NOTES_KEY
 from src.embedding_client import embedding_client
 from src.schemas import DreamType
 from src.utils.queue_payload import ScopeBackfillPayload, ScopeRemovalPayload
@@ -48,6 +51,10 @@ logger = logging.getLogger(__name__)
 # internal_metadata key linking a backfilled copy to the global document it
 # was copied from. The presence of this key is the idempotency marker.
 COPIED_FROM_KEY = "copied_from"
+
+# Specs embedded, written, and synced per pass. Bounds the live embeddings
+# (~40KB each as Python floats) so a large session cannot OOM the deriver.
+BACKFILL_CHUNK_SIZE = 500
 
 
 def _store_embeddings_in_postgres() -> bool:
@@ -84,6 +91,7 @@ class _CopySpec:
     internal_metadata: dict[str, Any]
     times_derived: int
     source_ids: list[str] | None
+    source_message_ids: list[str] | None
     session_name: str
     restore_document_id: str | None = None
 
@@ -173,7 +181,24 @@ async def _run_backfill(
     plans: list[_CopySpec] = []
     async with tracked_db("scope_backfill.plan") as db:
         source_result = await db.execute(
-            select(models.Document).where(
+            select(models.Document)
+            .options(
+                load_only(
+                    models.Document.id,
+                    models.Document.workspace_name,
+                    models.Document.observer,
+                    models.Document.observed,
+                    models.Document.content,
+                    models.Document.level,
+                    models.Document.times_derived,
+                    models.Document.internal_metadata,
+                    models.Document.session_name,
+                    # source_ids falls back to this column for undrained rows.
+                    models.Document.legacy_source_ids,
+                    models.Document.deleted_at,
+                )
+            )
+            .where(
                 models.Document.workspace_name == workspace_name,
                 models.Document.session_name == session_name,
                 models.Document.level == "explicit",
@@ -196,7 +221,19 @@ async def _run_backfill(
         # by (observed, copied_from). Includes soft-deleted rows: those are
         # restore candidates, not blockers.
         copies_result = await db.execute(
-            select(models.Document).where(
+            select(models.Document)
+            .options(
+                load_only(
+                    models.Document.id,
+                    models.Document.workspace_name,
+                    models.Document.observer,
+                    models.Document.observed,
+                    models.Document.session_name,
+                    models.Document.internal_metadata,
+                    models.Document.deleted_at,
+                )
+            )
+            .where(
                 models.Document.workspace_name == workspace_name,
                 models.Document.observer == scope_peer,
                 models.Document.session_name == session_name,
@@ -216,17 +253,19 @@ async def _run_backfill(
             key = (source.observed, source.id)
             if key in live_copies:
                 continue
+            # Vectors hydrate per chunk; plans only carry ids + content.
             plans.append(
                 _CopySpec(
                     observed=source.observed,
                     source_id=source.id,
                     content=source.content,
-                    embedding=_embedding_as_list(source.embedding),
+                    embedding=None,
                     internal_metadata=dict(source.internal_metadata),
                     times_derived=source.times_derived,
                     source_ids=list(source.source_ids)
                     if source.source_ids is not None
                     else None,
+                    source_message_ids=source.source_message_ids,
                     session_name=session_name,
                     restore_document_id=soft_deleted_copies.get(key),
                 )
@@ -235,7 +274,54 @@ async def _run_backfill(
     if not plans:
         return 0, set()
 
-    # Phase 2 (no DB): fill missing embeddings. Source rows have NULL
+    # Phases 2-4 run per chunk so only one chunk's embeddings are alive at a
+    # time; each chunk's vectors are dropped once synced.
+    store_in_postgres = _store_embeddings_in_postgres()
+    touched_observed: set[str] = set()
+    copied = 0
+    for start in range(0, len(plans), BACKFILL_CHUNK_SIZE):
+        chunk = plans[start : start + BACKFILL_CHUNK_SIZE]
+        if not await _copy_chunk(
+            workspace_name, scope_peer, session_name, chunk, store_in_postgres
+        ):
+            return None
+        copied += len(chunk)
+        touched_observed.update(spec.observed for spec in chunk)
+        for spec in chunk:
+            spec.embedding = None
+
+    return copied, touched_observed
+
+
+async def _hydrate_chunk_embeddings(
+    workspace_name: str, plans: list[_CopySpec]
+) -> None:
+    """Load this chunk's source embeddings from postgres (if any)."""
+    source_ids = [spec.source_id for spec in plans]
+    async with tracked_db("scope_backfill.hydrate_embeddings") as db:
+        result = await db.execute(
+            select(models.Document.id, models.Document.embedding).where(
+                models.Document.workspace_name == workspace_name,
+                models.Document.id.in_(source_ids),
+            )
+        )
+        by_id = {row.id: _embedding_as_list(row.embedding) for row in result.all()}
+    for spec in plans:
+        spec.embedding = by_id.get(spec.source_id)
+
+
+async def _copy_chunk(
+    workspace_name: str,
+    scope_peer: str,
+    session_name: str,
+    plans: list[_CopySpec],
+    store_in_postgres: bool,
+) -> bool:
+    """Embed, write, and sync one chunk. False if the session left the scope."""
+    # Phase 2a (DB): pull this chunk's embeddings only.
+    await _hydrate_chunk_embeddings(workspace_name, plans)
+
+    # Phase 2b (no DB): fill missing embeddings. Source rows have NULL
     # embeddings on external-store deployments (and soft-deleted copies may
     # have lost their vectors) — re-embed via the embedding API only; no LLM.
     missing = [spec for spec in plans if spec.embedding is None]
@@ -254,17 +340,22 @@ async def _run_backfill(
             spec.embedding = embedding
 
     # Phase 3 (DB): write the copies.
-    store_in_postgres = _store_embeddings_in_postgres()
     touched_observed = {spec.observed for spec in plans}
     new_rows: list[models.Document] = []
     async with tracked_db("scope_backfill.write") as db:
-        # scope_backfill and scope_removal carry different work-unit keys, so
-        # nothing orders them: a removal enqueued right after the add (or one
-        # that landed while phase 2 was embedding) can sweep the scope before
-        # these copies exist. Re-checking membership here, in the transaction
-        # that inserts, keeps a removed session from being copied back in.
-        if not await is_peer_in_session(db, workspace_name, session_name, scope_peer):
-            return None
+        # Row-lock active membership for this txn so a concurrent leave
+        # (``left_at``) cannot commit between the check and the inserts.
+        membership = await db.scalar(
+            select(models.SessionPeer.peer_name)
+            .where(models.SessionPeer.workspace_name == workspace_name)
+            .where(models.SessionPeer.session_name == session_name)
+            .where(models.SessionPeer.peer_name == scope_peer)
+            .where(models.SessionPeer.left_at.is_(None))
+            .with_for_update()
+            .limit(1)
+        )
+        if membership is None:
+            return False
 
         for observed in sorted(touched_observed):
             await crud.get_or_create_collection(
@@ -272,9 +363,21 @@ async def _run_backfill(
             )
 
         restore_ids: list[str] = []
+        restored_citations: list[dict[str, Any]] = []
         for spec in plans:
             if spec.restore_document_id is not None:
                 restore_ids.append(spec.restore_document_id)
+                restored_citations.extend(
+                    {
+                        "conclusion_id": spec.restore_document_id,
+                        "message_id": link.message_id,
+                        "position": link.position,
+                        "workspace_name": workspace_name,
+                    }
+                    for link in build_source_message_links(
+                        spec.source_message_ids, workspace_name
+                    )
+                )
                 continue
             row = models.Document(
                 workspace_name=workspace_name,
@@ -289,6 +392,7 @@ async def _run_backfill(
                 },
                 session_name=spec.session_name,
                 source_ids=spec.source_ids,
+                source_message_ids=spec.source_message_ids,
                 embedding=spec.embedding if store_in_postgres else None,
             )
             row.sync_state = "pending"
@@ -301,6 +405,17 @@ async def _run_backfill(
                 .where(models.Document.id.in_(restore_ids))
                 .values(deleted_at=None, sync_state="pending")
             )
+            # The source may have gained citations since this copy was
+            # removed; a restored copy takes the source's current set.
+            await db.execute(
+                delete(models.ConclusionSourceMessage).where(
+                    models.ConclusionSourceMessage.conclusion_id.in_(restore_ids)
+                )
+            )
+            if restored_citations:
+                await db.execute(
+                    insert(models.ConclusionSourceMessage), restored_citations
+                )
         await db.commit()
 
         # IDs are generated client-side and remain accessible post-commit
@@ -319,8 +434,7 @@ async def _run_backfill(
     # Phase 4: sync to the external vector store (or mark synced in pgvector
     # mode). Failures leave rows in sync_state='pending' for the reconciler.
     await _sync_copies_to_vector_store(workspace_name, scope_peer, plans, copied_ids)
-
-    return len(plans), touched_observed
+    return True
 
 
 async def _sync_copies_to_vector_store(
@@ -423,7 +537,8 @@ async def process_scope_removal(
                 models.Collection.observer == scope_peer,
             )
         )
-        for observed in [row[0] for row in observed_result.all()]:
+        observed_in_scope = [row[0] for row in observed_result.all()]
+        for observed in observed_in_scope:
             explicit_stmt = (
                 update(models.Document)
                 .where(
@@ -441,7 +556,7 @@ async def process_scope_removal(
             all_removed = list(frontier)
 
             # Fail-closed cascade: soft-delete derived documents whose support
-            # (source_ids) intersects anything removed, transitively — a
+            # (document_sources) intersects anything removed, transitively — a
             # deduction resting on removed evidence must leave with it, and so
             # must an induction resting on that deduction.
             while frontier:
@@ -453,7 +568,15 @@ async def process_scope_removal(
                         models.Document.observed == observed,
                         models.Document.level != "explicit",
                         models.Document.deleted_at.is_(None),
-                        models.Document.source_ids.has_any(array(frontier)),
+                        or_(
+                            exists().where(
+                                models.DocumentSource.derived_id == models.Document.id,
+                                models.DocumentSource.source_id.in_(frontier),
+                                models.DocumentSource.workspace_name == workspace_name,
+                            ),
+                            # Undrained rows still link through the legacy column.
+                            models.Document.legacy_source_ids.has_any(array(frontier)),
+                        ),
                     )
                     .values(deleted_at=func.now())
                     .returning(models.Document.id)
@@ -464,6 +587,24 @@ async def process_scope_removal(
             if all_removed:
                 removed_by_observed[observed] = all_removed
 
+        # Dream notes are free text, possibly written from the removed
+        # session's messages even where it left no conclusions, so they go for
+        # every collection in the scope, in the same commit as the conclusions.
+        # Unlike the card they can't be rebuilt from what remains. A new epoch
+        # turns away note writes from dreams that started before this, which
+        # may still hold the old notes. The cursor stays.
+        epoch = str(generate_nanoid())
+        for observed in observed_in_scope:
+            await crud.merge_collection_internal_metadata_value(
+                db,
+                workspace_name,
+                scope_peer,
+                observed,
+                NOTES_KEY,
+                {"entries": [], EPOCH_KEY: epoch},
+                commit=False,
+            )
+
         # The session left the scope, so its backfill status entry is moot;
         # clearing it keeps a later re-add starting from a fresh "pending".
         await crud.clear_scope_backfill_status(
@@ -471,6 +612,8 @@ async def process_scope_removal(
         )
         await db.commit()
     await crud.invalidate_scope_peer_cache(workspace_name, scope_peer)
+    for observed in observed_in_scope:
+        await crud.invalidate_collection_cache(workspace_name, scope_peer, observed)
 
     # Delete the vectors eagerly so recall can't surface removed memory while
     # waiting for the reconciler sweep (which remains the backstop on failure).

@@ -7,7 +7,8 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from src.vector_store.lancedb import LanceDBVectorStore
+pytest.importorskip("lancedb")
+from src.vector_store.lancedb import LanceDBVectorStore  # noqa: E402
 
 
 def _build_query_chain(rows: list[dict[str, Any]]) -> MagicMock:
@@ -170,3 +171,24 @@ async def test_query_filters_by_max_distance(store: LanceDBVectorStore) -> None:
     )
 
     assert [r.id for r in results] == ["vec_close"]
+
+
+@pytest.mark.asyncio
+async def test_query_returns_empty_without_opening_table_on_nonpositive_top_k(
+    store: LanceDBVectorStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    get_table = AsyncMock(return_value=MagicMock())
+    monkeypatch.setattr(store, "_get_table", get_table)
+
+    for top_k in (0, -1):
+        assert (
+            await store.query(
+                "honcho.msg.test",
+                [0.1, 0.2, 0.3, 0.4],
+                top_k=top_k,
+            )
+            == []
+        )
+
+    get_table.assert_not_awaited()

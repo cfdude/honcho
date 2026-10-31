@@ -1,17 +1,21 @@
+import * as Sentry from "@sentry/cloudflare";
 import { createMcpHandler } from "agents/mcp";
 import {
   accessHeaders,
+  HEADER_PLUGIN,
+  honchoClients,
+  identityHeaders,
   parseConfig,
-  createClientFactory,
-  createUnscopedClient,
+  sentryOptions,
   type Env,
 } from "./config.js";
 import { createServer } from "./server.js";
+import { invalidTokenResponse } from "./types.js";
 
 const CORS_ORIGIN = "*";
 const CORS_METHODS = "GET, POST, DELETE, OPTIONS";
 const CORS_ALLOWED_HEADERS =
-  "Content-Type, Authorization, X-Honcho-Workspace-ID";
+  "Content-Type, Authorization, X-Honcho-Workspace-ID, X-Honcho-Plugin";
 
 const CORS_HEADERS = {
   "Access-Control-Allow-Origin": CORS_ORIGIN,
@@ -23,6 +27,7 @@ const CORS_HEADERS = {
 const PROTECTED_RESOURCE_PATH = "/.well-known/oauth-protected-resource";
 const HEALTHCHECK_TIMEOUT_MS = 15_000;
 
+
 function resourceUrl(request: Request): string {
   return new URL(request.url).origin;
 }
@@ -31,7 +36,7 @@ function authorizationServer(env: Env): string {
   return env.HONCHO_API_URL?.trim() || "https://api.honcho.dev";
 }
 
-export default {
+export default Sentry.withSentry(sentryOptions, {
   // Probes the authorization server API to confirm it is reachable and healthy.
   async scheduled(
     _controller: ScheduledController,
@@ -114,21 +119,44 @@ export default {
     }
 
     try {
+      let rejected = false;
       const server = createServer({
         config,
-        clientFor: createClientFactory(config),
-        unscoped: createUnscopedClient(config),
+        ...honchoClients(
+          config,
+          identityHeaders(
+            request.headers.get("User-Agent"),
+            request.headers.get(HEADER_PLUGIN),
+          ),
+        ),
+        onUnauthorized: () => {
+          rejected = true;
+        },
       });
       const handler = createMcpHandler(server, {
         route: "/",
+        // Tool results come back as one JSON body, so the status line is
+        // decided after the tool ran and a rejected token can be a real 401.
+        enableJsonResponse: true,
         corsOptions: {
           origin: CORS_ORIGIN,
           methods: CORS_METHODS,
           headers: CORS_ALLOWED_HEADERS,
         },
       });
-      return await handler(request, env, executionCtx);
+      const response = await handler(request, env, executionCtx);
+      if (rejected) {
+        // The Honcho API refused this request's OAuth access token. Answer
+        // 401 so the MCP client refreshes the token and retries; a tool
+        // error inside a 200 would leave it believing it is signed in.
+        return invalidTokenResponse(
+          `${resourceUrl(request)}${PROTECTED_RESOURCE_PATH}`,
+          CORS_HEADERS,
+        );
+      }
+      return response;
     } catch (e) {
+      Sentry.captureException(e);
       const message =
         e instanceof Error ? e.message : "Internal server error";
       return new Response(JSON.stringify({ error: message }), {
@@ -137,4 +165,4 @@ export default {
       });
     }
   },
-};
+} satisfies ExportedHandler<Env>);

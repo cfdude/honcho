@@ -7,7 +7,8 @@ from contextlib import suppress
 from typing import Any
 
 from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.exc import DBAPIError
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
 from src import crud, exceptions, models, schemas
 from src.config import settings
@@ -25,9 +26,19 @@ from src.utils.representation import (
     Representation,
     allowlist_safe_levels,
 )
+from src.utils.sanitization import strip_nul
 from src.utils.types import embedding_call_purpose
 
 logger = logging.getLogger(__name__)
+
+
+def _is_autocommit(db: AsyncSession) -> bool:
+    """True when the session is bound to an AUTOCOMMIT (read-only) engine."""
+    bind = db.bind
+    return (
+        isinstance(bind, AsyncEngine)
+        and bind.get_execution_options().get("isolation_level") == "AUTOCOMMIT"
+    )
 
 
 def _observation_text(obs: ExplicitObservation | DeductiveObservation) -> str:
@@ -38,10 +49,21 @@ def _observation_text(obs: ExplicitObservation | DeductiveObservation) -> str:
 def _normalized_observation(
     obs: ExplicitObservation | DeductiveObservation,
 ) -> ExplicitObservation | DeductiveObservation:
-    """Return an observation with its persisted/embed text normalized."""
-    text = _observation_text(obs).strip()
+    """Return an observation with its persisted/embed text normalized.
+
+    NUL bytes are removed here rather than closer to the database so that the
+    text that gets embedded is the same text that gets stored.
+    """
+    text = strip_nul(_observation_text(obs)).strip()
     if isinstance(obs, DeductiveObservation):
-        return obs.model_copy(update={"conclusion": text})
+        return obs.model_copy(
+            update={
+                "conclusion": text,
+                # Premises ride along in internal_metadata, and jsonb rejects
+                # NUL in strings just as text columns do.
+                "premises": strip_nul(obs.premises),
+            }
+        )
     return obs.model_copy(update={"content": text})
 
 
@@ -87,10 +109,15 @@ class RepresentationManager:
             logger.debug("No observations to save")
             return empty_result
 
+        # Normalize before the emptiness check: str.strip() does not remove
+        # NUL, so content that normalizes away has to be dropped afterwards.
         all_observations = [
-            _normalized_observation(obs)
-            for obs in representation.deductive + representation.explicit
-            if _observation_text(obs).strip()
+            normalized
+            for normalized in (
+                _normalized_observation(obs)
+                for obs in representation.deductive + representation.explicit
+            )
+            if _observation_text(normalized)
         ]
         if not all_observations:
             logger.debug("No non-empty observations to save")
@@ -168,6 +195,7 @@ class RepresentationManager:
         documents_to_create: list[schemas.DocumentCreate] = []
         for obs, embedding in zip(all_observations, embeddings, strict=True):
             # NOTE: will add additional levels of reasoning in the future
+            source_message_ids: list[str] | None = None
             if isinstance(obs, DeductiveObservation):
                 obs_level = "deductive"
                 obs_content = obs.conclusion
@@ -176,6 +204,7 @@ class RepresentationManager:
                 obs_level = "explicit"
                 obs_content = obs.content
                 obs_premises = None
+                source_message_ids = obs.source_message_ids or None
 
             metadata: schemas.DocumentMetadata = schemas.DocumentMetadata(
                 message_ids=message_ids,
@@ -190,6 +219,7 @@ class RepresentationManager:
                     level=obs_level,
                     metadata=metadata,
                     embedding=embedding,
+                    source_message_ids=source_message_ids,
                 )
             )
 
@@ -344,10 +374,8 @@ class RepresentationManager:
             # no derived observations requested
             top_observations = 0
 
-        # remaining observations are recent
-        recent_observations = total - semantic_observations - top_observations
-
         representation = Representation()
+        selected_document_ids: set[str] = set()
 
         # Get semantic observations if requested
         if include_semantic_query:
@@ -362,19 +390,33 @@ class RepresentationManager:
             representation.merge_representation(
                 Representation.from_documents(semantic_docs)
             )
+            selected_document_ids.update(document.id for document in semantic_docs)
 
-        # Get most derived observations if requested
+        # Get most derived observations if requested. The semantic query may
+        # return fewer documents than requested, so cap this query by the
+        # actual remaining representation capacity rather than the configured
+        # budget alone.
         if include_most_derived:
+            remaining_observations = max(0, total - representation.len())
             derived_docs = await self._query_documents_most_derived(
-                db, top_k=top_observations, session_allowlist=session_allowlist
+                db,
+                top_k=min(top_observations, remaining_observations),
+                session_allowlist=session_allowlist,
             )
             representation.merge_representation(
                 Representation.from_documents(derived_docs)
             )
+            selected_document_ids.update(document.id for document in derived_docs)
 
-        # Get recent observations
+        # Reclaim any capacity left by queries that returned fewer unique
+        # documents than requested. This keeps the final representation from
+        # shrinking when semantic or most-derived search underfills its slice.
+        recent_observations = max(0, total - representation.len())
         recent_docs = await self._query_documents_recent(
-            db, top_k=recent_observations, session_allowlist=session_allowlist
+            db,
+            top_k=recent_observations,
+            session_allowlist=session_allowlist,
+            excluded_document_ids=selected_document_ids,
         )
 
         representation.merge_representation(Representation.from_documents(recent_docs))
@@ -391,7 +433,18 @@ class RepresentationManager:
         embedding: list[float] | None = None,
         session_allowlist: list[str] | None = None,
     ) -> list[models.Document]:
-        """Query documents by semantic similarity."""
+        """Query documents by semantic similarity.
+
+        Failures degrade to no semantic observations so the representation can
+        still be built from the other sources. Callers pass read-only
+        (AUTOCOMMIT) sessions, so a failed statement can't leave an aborted
+        transaction behind. A dropped connection can, though: SQLAlchemy
+        invalidates it and refuses every further query on the session with
+        PendingRollbackError until rollback() is called, so roll back before
+        degrading. Under AUTOCOMMIT the rollback is a no-op on the wire. On a
+        transactional session it would discard the caller's uncommitted
+        writes, so there the error propagates instead.
+        """
         try:
             if level:
                 return await self._query_documents_for_level(
@@ -421,12 +474,23 @@ class RepresentationManager:
                 db.expunge_all()
                 return list(documents)
 
-        except Exception as e:
-            logger.error(f"Error getting relevant observations: {e}")
+        except DBAPIError as e:
+            if e.connection_invalidated:
+                if not _is_autocommit(db):
+                    raise
+                await db.rollback()
+            logger.exception("Error getting relevant observations")
+            return []
+        except Exception:
+            logger.exception("Error getting relevant observations")
             return []
 
     async def _query_documents_recent(
-        self, db: AsyncSession, top_k: int, session_allowlist: list[str] | None = None
+        self,
+        db: AsyncSession,
+        top_k: int,
+        session_allowlist: list[str] | None = None,
+        excluded_document_ids: set[str] | None = None,
     ) -> list[models.Document]:
         """Query most recent documents."""
         stmt = (
@@ -437,6 +501,11 @@ class RepresentationManager:
                 models.Document.observer == self.observer,
                 models.Document.observed == self.observed,
                 models.Document.deleted_at.is_(None),
+                *(
+                    [models.Document.id.notin_(excluded_document_ids)]
+                    if excluded_document_ids
+                    else []
+                ),
                 *(
                     [
                         models.Document.session_name.in_(session_allowlist),

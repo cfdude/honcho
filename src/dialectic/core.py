@@ -11,19 +11,29 @@ from collections.abc import AsyncIterator, Callable
 from typing import Any, cast
 
 from nanoid import generate as generate_nanoid
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
-from src import crud
-from src.config import ConfiguredModelSettings, ReasoningLevel, settings
+from src import crud, models
+from src.config import (
+    ConfiguredModelSettings,
+    DialecticLevelSettings,
+    ReasoningLevel,
+    settings,
+)
 from src.dependencies import tracked_db
 from src.dialectic import prompts
+from src.dreamer.working_memory import load_map_entries
 from src.embedding_client import embedding_client
+from src.exceptions import StructuredResponseError
 from src.llm import (
     HonchoLLMCallResponse,
     StreamingResponseWithMetadata,
     honcho_llm_call,
 )
-from src.llm.types import LLMTelemetryContext
+from src.llm.runtime import CapturedAgentSpan, start_captured_span
+from src.llm.structured_output import StructuredOutputError
+from src.llm.types import BudgetLine, LLMTelemetryContext
+from src.schemas import ResolvedDialecticConfiguration
 from src.telemetry import prometheus_metrics
 from src.telemetry.events import DialecticCompletedEvent, EmbeddingCallPurpose, emit
 from src.telemetry.logging import (
@@ -38,10 +48,28 @@ from src.utils.agent_tools import (
     create_tool_executor,
     search_memory,
 )
+from src.utils.evidence import EvidenceAccumulator
 from src.utils.formatting import format_new_turn_with_timestamp
+from src.utils.memory_brief import load_memory_counts, memory_layout_section
+from src.utils.tokens import estimate_tokens
 from src.utils.types import embedding_call_purpose
 
 logger = logging.getLogger(__name__)
+
+
+# Below this many tool iterations a budget line is noise.
+MIN_ITERATIONS_FOR_BUDGET_LINE = 3
+
+
+def dialectic_budget_line(used: int, limit: int) -> str | None:
+    """Budget line for the dialectic: how many calls are used, and when to answer."""
+    if used >= limit:
+        # The loop is about to make its no-tools final call, which says so.
+        return None
+    line = f"Tool calls used: {used} of {limit}."
+    if limit - used == 1:
+        line += " On the next call, answer from what you have."
+    return line
 
 
 def _get_dialectic_level_model_config(
@@ -71,6 +99,8 @@ class DialecticAgent:
         reasoning_level: ReasoningLevel = "low",
         session_id: str | None = None,
         session_allowlist: list[str] | None = None,
+        evidence: EvidenceAccumulator | None = None,
+        instructions: ResolvedDialecticConfiguration | None = None,
     ):
         """
         Initialize the dialectic agent.
@@ -88,6 +118,11 @@ class DialecticAgent:
             session_allowlist: Optional session allowlist restricting all recall
                 (conclusions and messages) to these sessions; empty list
                 fails closed
+            evidence: Optional accumulator collecting the conclusions and
+                messages this run reads, for callers that asked for evidence.
+                Passing None collects nothing.
+            instructions: Resolved dialectic configuration carrying the custom
+                instructions and where they were resolved from
         """
         self.workspace_name: str = workspace_name
         self.session_name: str | None = session_name
@@ -99,6 +134,9 @@ class DialecticAgent:
         self.observed_peer_card: list[str] | None = observed_peer_card
         self.metric_key: str | None = metric_key
         self.reasoning_level: ReasoningLevel = reasoning_level
+        self.instructions: ResolvedDialecticConfiguration = (
+            instructions or ResolvedDialecticConfiguration()
+        )
 
         # Initialize conversation history with system prompt
         self.messages: list[dict[str, str]] = [
@@ -114,12 +152,23 @@ class DialecticAgent:
                         for tool in self._select_tools()
                         if isinstance((name := tool.get("name")), str)
                     },
+                    custom_instructions=self.instructions.custom_instructions,
                 ),
             }
         ]
         self._session_history_initialized: bool = False
         self._prefetched_conclusion_count: int = 0
+        self.evidence: EvidenceAccumulator | None = evidence
         self._run_id: str = generate_nanoid()  # Always generate for event correlation
+        if self._layout_enabled():
+            self.messages[0]["content"] += "\n\n" + memory_layout_section(
+                available_tools=(
+                    name
+                    for tool in self._select_tools()
+                    if isinstance((name := tool.get("name")), str)
+                ),
+                cite_ids=False,
+            )
 
     def _select_tools(self) -> list[dict[str, Any]]:
         """Pick the toolset for this query.
@@ -138,6 +187,75 @@ class DialecticAgent:
         if self.session_allowlist is not None:
             tools = [t for t in tools if t.get("name") != "get_reasoning_chain"]
         return tools
+
+    def _tool_choice(
+        self, level_settings: DialecticLevelSettings
+    ) -> str | dict[str, Any] | None:
+        """Pick the tool_choice for this query.
+
+        Defaults to whatever the reasoning level configures. Subclasses override
+        when the agent has no prefetched corpus to fall back on and so must
+        search before it can answer. Forcing "required"/"any" here costs exactly
+        one tool round rather than pinning the loop: `execute_tool_loop` relaxes
+        it to "auto" after the first iteration so the model can still stop and
+        synthesize.
+        """
+        return level_settings.TOOL_CHOICE
+
+    def _force_tools_until(self) -> frozenset[str] | None:
+        """Tools that satisfy a forced tool_choice; None means any tool does."""
+        return None
+
+    def _layout_enabled(self) -> bool:
+        """Whether the memory-layout section goes in the system prompt.
+
+        Pair-scoped only: the workspace agent replaces the system prompt.
+        """
+        return settings.DIALECTIC.BRIEF_ENABLED
+
+    def _pair_brief_enabled(self) -> bool:
+        """Whether counts and the dreamer's map notes go in the first message.
+
+        Both are drawn from every session of the pair, so a session allowlist
+        rules them out: they would reach past the allowed sessions.
+        """
+        return settings.DIALECTIC.BRIEF_ENABLED and self.session_allowlist is None
+
+    async def _pair_brief(self) -> str | None:
+        """Counts and the dreamer's map notes for the first message, if enabled."""
+        if not self._pair_brief_enabled():
+            return None
+        parts: list[str] = []
+        try:
+            parts.append(
+                await load_memory_counts(
+                    self.workspace_name, observer=self.observer, observed=self.observed
+                )
+            )
+            if settings.DREAM.NOTES_MODE == "on":
+                entries = await load_map_entries(
+                    self.workspace_name, observer=self.observer, observed=self.observed
+                )
+                if entries:
+                    parts.append(
+                        "## HOW THIS MEMORY IS ORGANIZED (dreamer's notes)\n"
+                        + "\n".join(f"- {entry.text}" for entry in entries)
+                    )
+        except Exception:
+            logger.warning("Failed to load the memory brief", exc_info=True)
+        return "\n\n".join(parts) or None
+
+    def _budget_line(self, level_settings: DialecticLevelSettings) -> BudgetLine | None:
+        """Budget line for this query, or None when off or the level is too small."""
+        if not settings.DIALECTIC.BUDGET_ENABLED:
+            return None
+        if self._max_tool_iterations(level_settings) < MIN_ITERATIONS_FOR_BUDGET_LINE:
+            return None
+        return dialectic_budget_line
+
+    def _max_tool_iterations(self, level_settings: DialecticLevelSettings) -> int:
+        """Tool rounds this query gets; defaults to the reasoning level's limit."""
+        return level_settings.MAX_TOOL_ITERATIONS
 
     async def _initialize_session_history(self) -> None:
         """Fetch and inject session history into the system prompt if configured."""
@@ -218,6 +336,13 @@ class DialecticAgent:
             ):
                 query_embedding = await embedding_client.embed(query)
 
+            # Prefetched conclusions never pass through the tool executor, so
+            # they are recorded here or not at all -- and on a query that
+            # answers without a tool call they are the whole of what was read.
+            prefetched: list[models.Document] | None = (
+                [] if self.evidence is not None else None
+            )
+
             # search_memory manages its own short-lived DB sessions so no
             # connection is held during external vector-store calls.
             explicit_repr = await search_memory(
@@ -229,6 +354,7 @@ class DialecticAgent:
                 levels=["explicit"],
                 embedding=query_embedding,
                 session_allowlist=self.session_allowlist,
+                documents_out=prefetched,
             )
 
             derived_repr = await search_memory(
@@ -240,6 +366,7 @@ class DialecticAgent:
                 levels=["deductive", "inductive", "contradiction"],
                 embedding=query_embedding,
                 session_allowlist=self.session_allowlist,
+                documents_out=prefetched,
             )
 
             if explicit_repr.is_empty() and derived_repr.is_empty():
@@ -261,6 +388,12 @@ class DialecticAgent:
                 # Include IDs for derived so agent can use get_reasoning_chain
                 parts.append(derived_repr.format_as_markdown(include_ids=True))
 
+            # Recorded last: everything above can still fail into the handler
+            # below, which drops the whole block from the prompt. Evidence should
+            # name what the agent saw, not what was fetched for it.
+            if self.evidence is not None and prefetched:
+                self.evidence.add_documents(prefetched)
+
             return "\n".join(parts)
 
         except Exception as e:
@@ -268,19 +401,27 @@ class DialecticAgent:
             return None
 
     async def _prepare_query(
-        self, query: str
-    ) -> tuple[Callable[[str, dict[str, Any]], Any], str, str | None, float]:
+        self, query: str, telemetry: LLMTelemetryContext
+    ) -> tuple[
+        Callable[[str, dict[str, Any]], Any],
+        str,
+        str | None,
+        float,
+        CapturedAgentSpan | None,
+    ]:
         """
         Prepare common state for answering a query.
 
         Handles session history initialization, metrics setup, observation prefetching,
-        user message construction, and tool executor creation.
+        user message construction, and tool executor creation. Opens the run span
+        before prefetch; the caller ends it.
 
         Args:
             query: The question to answer about the peer
+            telemetry: Telemetry context for the run
 
         Returns:
-            A tuple of (tool_executor, task_name, run_id, start_time)
+            A tuple of (tool_executor, task_name, run_id, start_time, run)
         """
         await self._initialize_session_history()
 
@@ -291,7 +432,19 @@ class DialecticAgent:
             run_id = generate_nanoid()
             task_name = f"dialectic_chat_{run_id}"
         start_time = time.perf_counter()
+        run = start_captured_span("run", telemetry, input=query)
+        try:
+            tool_executor = await self._prepare_messages(query, task_name)
+        except BaseException:
+            if run is not None:
+                run.end(is_error=True)
+            raise
+        return tool_executor, task_name, run_id, start_time, run
 
+    async def _prepare_messages(
+        self, query: str, task_name: str
+    ) -> Callable[[str, dict[str, Any]], Any]:
+        """Prefetch observations, append the user message, and build the tool executor."""
         accumulate_metric(
             task_name,
             "context",
@@ -321,13 +474,13 @@ class DialecticAgent:
         else:
             user_content = f"Query: {query}"
 
+        brief = await self._pair_brief()
+        if brief:
+            user_content = f"{user_content}\n\n{brief}"
+
         self.messages.append({"role": "user", "content": user_content})
 
-        tool_executor: Callable[
-            [str, dict[str, Any]], Any
-        ] = await self._create_tool_executor()
-
-        return tool_executor, task_name, run_id, start_time
+        return await self._create_tool_executor()
 
     async def _create_tool_executor(self) -> Callable[[str, dict[str, Any]], Any]:
         """Build the tool executor. Subclasses override to change tool scoping
@@ -338,10 +491,10 @@ class DialecticAgent:
             session_allowlist=self.session_allowlist,
             observer=self.observer,
             observed=self.observed,
-            history_token_limit=settings.DIALECTIC.HISTORY_TOKEN_LIMIT,
             run_id=self._run_id,
             agent_type="dialectic",
             parent_category="dialectic",
+            evidence=self.evidence,
         )
 
     def _prefetch_heading(self) -> str:
@@ -361,7 +514,7 @@ class DialecticAgent:
         Carries the instance's `_run_id` (always set in __init__) + workspace +
         peer identifiers so LLMCallCompletedEvent and 's
         AgentIterationEvent can attribute every per-iteration LLM call back to
-        this dialectic invocation. `track_name` names the Langfuse trace/step
+        this dialectic invocation. `track_name` names the trace/step
         (e.g. "Dialectic Agent" vs "Dialectic Agent Stream").
         """
         return LLMTelemetryContext(
@@ -373,8 +526,12 @@ class DialecticAgent:
             trace_id=self._run_id,
             span_id=self._run_id,
             session_id=self.session_id,
+            observer=self.observer,
+            observers=[self.observer],
+            observed=self.observed,
             peer_name=self.observed,
             track_name=track_name,
+            custom_instructions=self.instructions.custom_instructions,
         )
 
     def _log_response_metrics(
@@ -391,6 +548,9 @@ class DialecticAgent:
         thinking_content: str | None,
         iterations: int,
         hit_input_token_cap: bool = False,
+        hit_iteration_limit: bool = False,
+        iteration_limit: int | None = None,
+        budget_line_enabled: bool = False,
     ) -> None:
         """
         Log metrics common to both streaming and non-streaming responses.
@@ -407,6 +567,10 @@ class DialecticAgent:
             tool_calls_count: Number of tool calls made
             thinking_content: Thinking trace content (if any)
             iterations: Number of iterations in the tool execution loop
+            hit_input_token_cap: Whether an iteration's input exceeded the cap
+            hit_iteration_limit: Whether the tool loop ran out of iterations
+            iteration_limit: Tool-iteration limit this query was given
+            budget_line_enabled: Whether the model was shown its remaining budget
         """
         accumulate_metric(task_name, "tool_calls", tool_calls_count, "count")
 
@@ -460,6 +624,13 @@ class DialecticAgent:
                 cache_read_tokens=cache_read_input_tokens or 0,
                 cache_creation_tokens=cache_creation_input_tokens or 0,
                 hit_input_token_cap=hit_input_token_cap,
+                hit_iteration_limit=hit_iteration_limit,
+                iteration_limit=iteration_limit,
+                budget_line_enabled=budget_line_enabled,
+                custom_instructions_tokens=estimate_tokens(
+                    self.instructions.custom_instructions
+                ),
+                custom_instructions_source=self.instructions.custom_instructions_source,
             )
         )
 
@@ -482,7 +653,10 @@ class DialecticAgent:
         Returns:
             The synthesized answer string
         """
-        tool_executor, task_name, run_id, start_time = await self._prepare_query(query)
+        telemetry = self._telemetry_context(track_name="Dialectic Agent")
+        tool_executor, task_name, run_id, start_time, run = await self._prepare_query(
+            query, telemetry
+        )
 
         # Get level-specific settings
         level_settings = settings.DIALECTIC.LEVELS[self.reasoning_level]
@@ -495,32 +669,59 @@ class DialecticAgent:
             else settings.DIALECTIC.MAX_OUTPUT_TOKENS
         )
 
-        # cast: `type[BaseModel] | None` matches neither the parsed nor the
-        # plain-text overload statically, so pyright resolves the stream
-        # overload — but without stream=True the call is non-streaming.
-        response = cast(  # pyright: ignore[reportInvalidCast]
-            HonchoLLMCallResponse[Any],
-            await honcho_llm_call(
-                model_config=_get_dialectic_level_model_config(self.reasoning_level),
-                prompt="",  # Ignored since we pass messages
-                max_tokens=max_tokens,
-                tools=tools,
-                tool_choice=level_settings.TOOL_CHOICE,
-                tool_executor=tool_executor,
-                max_tool_iterations=level_settings.MAX_TOOL_ITERATIONS,
-                messages=self.messages,
-                max_input_tokens=settings.DIALECTIC.MAX_INPUT_TOKENS,
-                trace_name="dialectic_chat",
-                telemetry=self._telemetry_context(track_name="Dialectic Agent"),
-                response_model=response_model,
-            ),
-        )
+        try:
+            # cast: `type[BaseModel] | None` matches neither the parsed nor the
+            # plain-text overload statically, so pyright resolves the stream
+            # overload — but without stream=True the call is non-streaming.
+            response = cast(  # pyright: ignore[reportInvalidCast]
+                HonchoLLMCallResponse[Any],
+                await honcho_llm_call(
+                    model_config=_get_dialectic_level_model_config(
+                        self.reasoning_level
+                    ),
+                    prompt="",  # Ignored since we pass messages
+                    max_tokens=max_tokens,
+                    tools=tools,
+                    tool_choice=self._tool_choice(level_settings),
+                    force_tools_until=self._force_tools_until(),
+                    tool_executor=tool_executor,
+                    max_tool_iterations=self._max_tool_iterations(level_settings),
+                    budget_line=self._budget_line(level_settings),
+                    messages=self.messages,
+                    max_input_tokens=settings.DIALECTIC.MAX_INPUT_TOKENS,
+                    trace_name="dialectic_chat",
+                    telemetry=telemetry,
+                    response_model=response_model,
+                    run=run,
+                ),
+            )
+        except BaseException as exc:
+            if run is not None:
+                run.end(is_error=True)
+            if response_model is not None and isinstance(
+                exc, ValidationError | StructuredOutputError
+            ):
+                raise StructuredResponseError() from exc
+            raise
 
         # With response_model, the backend parses content into a model
         # instance; the API contract is a JSON string.
         content = response.content
         if isinstance(content, BaseModel):
             content = content.model_dump_json(by_alias=True)
+        elif response_model is not None:
+            # A backend that degrades instead of raising (json_object mode's
+            # empty answer or a refusal) hands back a plain string. The tool
+            # loop already retries those; this backstops any path that skips
+            # its check.
+            if run is not None:
+                run.end(is_error=True)
+            raise StructuredResponseError()
+        if run is not None:
+            run.end(output=content)
+
+        if self.evidence is not None:
+            self.evidence.record_tool_calls(response.tool_calls_made)
 
         self._log_response_metrics(
             task_name=task_name,
@@ -535,6 +736,9 @@ class DialecticAgent:
             thinking_content=response.thinking_content,
             iterations=response.iterations,
             hit_input_token_cap=response.hit_input_token_cap,
+            hit_iteration_limit=response.hit_iteration_limit,
+            iteration_limit=self._max_tool_iterations(level_settings),
+            budget_line_enabled=self._budget_line(level_settings) is not None,
         )
 
         return content
@@ -559,7 +763,10 @@ class DialecticAgent:
         Yields:
             Chunks of the response text as they are generated
         """
-        tool_executor, task_name, run_id, start_time = await self._prepare_query(query)
+        telemetry = self._telemetry_context(track_name="Dialectic Agent Stream")
+        tool_executor, task_name, run_id, start_time, run = await self._prepare_query(
+            query, telemetry
+        )
 
         # Get level-specific settings
         level_settings = settings.DIALECTIC.LEVELS[self.reasoning_level]
@@ -572,31 +779,47 @@ class DialecticAgent:
             else settings.DIALECTIC.MAX_OUTPUT_TOKENS
         )
 
-        response = cast(
-            StreamingResponseWithMetadata,
-            await honcho_llm_call(
-                model_config=_get_dialectic_level_model_config(self.reasoning_level),
-                prompt="",  # Ignored since we pass messages
-                max_tokens=max_tokens,
-                stream=True,
-                stream_final_only=True,
-                tools=tools,
-                tool_choice=level_settings.TOOL_CHOICE,
-                tool_executor=tool_executor,
-                max_tool_iterations=level_settings.MAX_TOOL_ITERATIONS,
-                messages=self.messages,
-                max_input_tokens=settings.DIALECTIC.MAX_INPUT_TOKENS,
-                trace_name="dialectic_chat",
-                telemetry=self._telemetry_context(track_name="Dialectic Agent Stream"),
-                response_model=response_model,
-            ),
-        )
-
         accumulated_content: list[str] = []
-        async for chunk in response:
-            if chunk.content:
-                accumulated_content.append(chunk.content)
-                yield chunk.content
+        is_error = False
+        try:
+            response = cast(
+                StreamingResponseWithMetadata,
+                await honcho_llm_call(
+                    model_config=_get_dialectic_level_model_config(
+                        self.reasoning_level
+                    ),
+                    prompt="",  # Ignored since we pass messages
+                    max_tokens=max_tokens,
+                    stream=True,
+                    stream_final_only=True,
+                    tools=tools,
+                    tool_choice=self._tool_choice(level_settings),
+                    force_tools_until=self._force_tools_until(),
+                    tool_executor=tool_executor,
+                    max_tool_iterations=self._max_tool_iterations(level_settings),
+                    budget_line=self._budget_line(level_settings),
+                    messages=self.messages,
+                    max_input_tokens=settings.DIALECTIC.MAX_INPUT_TOKENS,
+                    trace_name="dialectic_chat",
+                    telemetry=telemetry,
+                    response_model=response_model,
+                    run=run,
+                ),
+            )
+
+            async for chunk in response:
+                if chunk.content:
+                    accumulated_content.append(chunk.content)
+                    yield chunk.content
+        except BaseException as exc:
+            is_error = not isinstance(exc, GeneratorExit)
+            raise
+        finally:
+            if run is not None:
+                run.end(output="".join(accumulated_content) or None, is_error=is_error)
+
+        if self.evidence is not None:
+            self.evidence.record_tool_calls(response.tool_calls_made)
 
         self._log_response_metrics(
             task_name=task_name,
@@ -611,4 +834,7 @@ class DialecticAgent:
             thinking_content=response.thinking_content,
             iterations=response.iterations,
             hit_input_token_cap=response.hit_input_token_cap,
+            hit_iteration_limit=response.hit_iteration_limit,
+            iteration_limit=self._max_tool_iterations(level_settings),
+            budget_line_enabled=self._budget_line(level_settings) is not None,
         )

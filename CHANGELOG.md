@@ -5,6 +5,186 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](http://keepachangelog.com/)
 and this project adheres to [Semantic Versioning](http://semver.org/).
 
+## [Unreleased]
+
+### Changed
+
+- Langfuse Python SDK upgraded from 4.6.1 to 5.0.2, which sends traces on the Langfuse v4 ingestion path ahead of Langfuse Cloud's v4 cutover on 2026-11-16. Self-hosted Langfuse must be v4.59.0 or later; a v3 server no longer receives Honcho's traces. Observation metadata values are now JSON-encoded on the span (`"honcho"` rather than `honcho`), so saved Langfuse metadata filters written against the old shape may need updating. Trace names, user ids and the trace tree are unchanged
+
+### Fixed
+
+- Chat, the deriver, summaries and dreams no longer fail when an OpenAI-compatible model returns a usage total but omits the prompt and completion counts. The answer is kept and the missing counts are recorded as zero, instead of the request erroring and being sent again (#1410)
+
+## [3.4.1] - 2026-10-23
+
+### Security
+
+- The Docker image ships certifi 2026.10.19, up from 2026.4.22, so outbound TLS from the API and the deriver (LLM providers, embeddings, webhooks) verifies against the current CA bundle. The build's uv moves from 0.9.24 to 0.13.5. Self-hosted deployments that install from `uv.lock` need uv 0.13.5 or newer: older uv ignores the lockfile's per-package `exclude-newer` override for certifi and resolves an older bundle (#1439)
+
+### Fixed
+
+- In filters, a `"*"` wildcard or an empty `{}` now counts as TRUE inside `AND`, `OR` and `NOT` instead of being dropped. `{"OR": [{"id": "*"}, {"id": "bob"}]}` used to narrow to bob and now matches every row, and `{"NOT": [{"id": "*"}]}` or `{"NOT": [{}]}` used to match every row and now matches none. A wildcard or `{}` at the top level still selects every row. `source_ids: ["a", "*"]` now matches conclusions linked to `a` instead of every conclusion. Queries never widen past their workspace (#1433)
+- LLM calls no longer retry a request the provider rejected outright when no fallback model is configured. A 4xx other than 408, 409, 425 or 429 (for example a 400 for a prompt over the context window, or a 401) now fails on the first attempt instead of being sent three times with about 8s of backoff. Transient failures (408, 409, 425, 429, 5xx, connection errors) and the response checks that consume attempts (refused or empty summaries and representations, structured answers that miss their schema) are retried as before. With a fallback configured nothing changes: the rejected request is still retried and the final attempt goes to the fallback. Applies to the deriver, summarizer, dialectic and dreamer, which all call through `honcho_llm_call` (#1435)
+- Session summaries stay under a new input budget, `SUMMARY_MAX_INPUT_TOKENS` (default 100,000). The summary window is chosen by message count, so long messages could produce a prompt larger than the model's context window. The provider then rejected it, the summary was not saved, and every later summary of that session failed the same way. The oldest messages in the window are now dropped to fit, with a warning in the log, and a single message too large for the budget on its own is clipped. Windows that already fit are unchanged. Startup fails if the budget is less than twice the larger of `SUMMARY_MAX_TOKENS_SHORT` and `SUMMARY_MAX_TOKENS_LONG`, since the previous summary is always sent in full and messages need room beside it (#1449)
+
+## [3.4.0] - 2026-10-20
+
+### Added
+
+- Explicit conclusions cite the messages they came from. The deriver emits `source_indices` per conclusion, resolved against the batch and stored as edges in a new `conclusion_source_messages` table (DDL-only migration `c4d8e2f6a1b3`, no backfill: citations are per-derivation, so rows written earlier surface null). Conclusions responses carry `source_message_ids` (public message ids, citation order; null for derived levels), and `source_message_ids` joins the documents filter allowlist with the same `contains` / `in` / bare-list grammar as `source_ids`, so `POST /conclusions/list` answers "which conclusions cite this message?". Cited messages may belong to any peer in the batch, not only the observed one. When a conclusion is derived again, exact or semantic deduplication merges the new citations into the kept conclusion, and copies made when a session joins a scope keep theirs. The batch-level `message_ids` metadata is unchanged (#935)
+- Workspace, peer and session responses carry `uid`, the immutable identifier Honcho assigns (the row's internal id). `id` is unchanged and stays the client-chosen name, so clients can start storing `uid` as a reference that won't move if names become renameable. Every route that returns these objects includes it: get-or-create, list, update, clone, session peers, peer sessions and scope sessions. Additive, no migration (#1394)
+- Named-scope API keys: a key bound to one named scope, for recall and for message ingestion (including creating new member sessions). Recall automatically uses the key's projection, session access requires active scope membership, and a restricted key cannot enroll unrelated sessions or use global resource routes. New keys carry a dedicated JWT audience, so an older server rejects them instead of ignoring the scope claim and granting workspace access. On self-hosted instances with authentication enabled, mint one with `scripts/generate_jwt.py`; the scopes documentation lists the supported routes and limits. Managed (Groudon) keys need separate support, and the high-level Python SDK and CLI helpers still attempt workspace provisioning, so restricted callers use REST or the SDKs' HTTP transports (#1341)
+- Dreamer working memory, all opt-in and off by default so today's behaviour is unchanged: the dreamer and the dialectic show the agent its remaining tool budget (`DREAM_BUDGET_ENABLED` / `DIALECTIC_BUDGET_ENABLED`) and a brief describing how memory is laid out, with conclusion counts by level and, for the dreamer, the conclusions created since the last dream (`DREAM_BRIEF_ENABLED` / `DIALECTIC_BRIEF_ENABLED`). The dreamer also reserves a write window at the end of each pass so planned writes are not lost when the iteration limit hits, and keeps capped working notes per representation from one dream to the next (`DREAM_NOTES_MODE`: `off`, `shadow` or `on`). Deduction and induction get their own iteration limits (`DREAM_DEDUCTION_MAX_TOOL_ITERATIONS` / `DREAM_INDUCTION_MAX_TOOL_ITERATIONS`); `DREAM_MAX_TOOL_ITERATIONS` now applies to card refresh only. Telemetry gains `hit_iteration_limit`, `write_window_used` and the `notes_*` / `new_conclusions_*` fields (#1378)
+- Telemetry emits `workspace.created`, `peer.created`, `session.created` and `scope.created` CloudEvents, once per row actually inserted, including resources created implicitly (posting messages into a new workspace, a workspace created through `POST /peers`). Repeat requests emit nothing. Still gated by `TELEMETRY_ENABLED` (default `false`), so self-hosted deployments without telemetry are unaffected (#1360)
+
+### Changed
+
+- This release includes a migration. It adds a `deletion_generation` counter (`INTEGER NOT NULL DEFAULT 0`, a catalog-only change) to workspaces, sessions and collections, and five partial indexes over unprocessed queue rows so pending work can be found by the peer, session or scope peer it touches. Nothing reads the counter or the indexes yet; they prepare the deletion lifecycle work, and the previous release's code runs fine against the new schema. The indexes are built `CONCURRENTLY`, so writes continue, but a build waits for open transactions that touched `queue` and for any older snapshot in the database, and after 60 minutes the migration fails and leaves an invalid index, which the next run drops and rebuilds. One index (`ix_queue_pending_observers`) needs the `btree_gin` extension; where it cannot be created, the migration skips that index and logs the statement to create it later. On large or busy databases, build the indexes ahead of the upgrade with the statements in the troubleshooting guide, and the migration then has nothing to do (#1409)
+- Startup warns when an LLM API key is set for a transport no workload uses — across primary models, fallbacks, every dialectic level and embeddings — as provider migrations can leave populated credentials behind silently. The warning names only the setting, never the value, and does not block startup (#1344)
+
+### Fixed
+
+- `provider_params.thinking_tool_choice_conflict` now applies on the OpenAI transport, where Anthropic models behind an OpenAI-compatible proxy used to ignore it. With thinking requested, it covers structured-output requests (the proxy turns the schema into a forced tool call) and forced tool choices. `override_thinking` drops thinking for the call; `override_tool` relaxes the tool choice to `auto` and requests the schema as `json_object`; `throw` raises. Unset leaves requests unchanged, but a config that already sets the key on the OpenAI transport now has it applied, including against OpenAI's own reasoning models, so set it only where the model is Anthropic. An unknown value now fails config load instead of failing requests with a 422 at runtime. Previously a proxy could leave the schema tool optional when thinking was on, so chats with a `response_format` could come back as prose and fail with a 500 (#1402)
+- The deriver accepts `PromptRepresentation.explicit` as a bare string or a list of strings from OpenAI-compatible structured-output backends, coercing each non-blank string into an observation instead of failing validation and dropping the whole batch to the empty fallback. Blank strings are dropped; genuinely malformed shapes still raise (#538)
+- The deriver fails loudly on malformed or degraded structured output instead of silently discarding the batch as an honest empty: bad payloads raise inside the retried LLM call, so they are retried, reach the fallback model, and error the queue item if every attempt fails. A clean-stop `{"explicit": []}` is still accepted. The summarizer gets the same treatment for blank responses cut off or filtered. Failure telemetry carries only the failure class, model and a payload digest, never the payload (#1373)
+- A chat request whose `response_format` answer still fails its schema after retries returns 422 (`The model's answer did not match the requested response_format`) instead of an opaque 500 that the SDKs retry and Sentry drops (#1379)
+- Tool-loop answers that miss their `response_model` — a plain-string refusal, or `json_object` mode's empty answer — are checked inside the retried call and raise, so they use the configured retries and fallback model before the request fails, instead of returning as a success and only then failing validation (#1393)
+- Dialectic chat no longer overflows the prompt on oversized tool output: message tools scope sessions in SQL instead of binding every session name as a parameter (which past 65,535 sessions hit the PostgreSQL parameter cap), tool error text is capped at `LLM.MAX_TOOL_OUTPUT_CHARS` instead of returning the expanded SQL statement to the model, and prompt truncation caps a single tool result at half the budget and drops middle units before the opening query (#1390)
+- Request bodies containing a lone surrogate escape (the half of a split emoji, or text decoded with the wrong codec) return the usual 422 validation body instead of a 500, so clients lose the single bad field's error rather than the whole batch (#1387)
+
+## [3.3.0] - 2026-10-09
+
+### Added
+
+- ChromaDB vector store backend: set `VECTOR_STORE_TYPE=chromadb` and pick a client with `VECTOR_STORE_CHROMA_CLIENT_MODE`: `http` (self-hosted Chroma server, the default) or `cloud` (Chroma Cloud, needs `VECTOR_STORE_CHROMA_API_KEY`). Embedded `persistent` mode is rejected at startup, since it isn't safe across Honcho's API and deriver processes. Each Honcho namespace gets its own Chroma collection and index. Ships as an optional extra (`uv sync --extra chromadb`), so default installs and the Docker image don't include it (#868)
+- Custom instructions reach every agent, not just the deriver. A new top-level `custom_instructions` in workspace and session configuration is the shared fallback, and `summary`, `dialectic` (new section), `dream`, and `peer_card` each take their own `custom_instructions` override. Message, session, and workspace levels are checked in that order and the first that sets a value wins; within a level the module's value beats the shared one, and `""` means no instructions. `reasoning.custom_instructions` stays deriver-only, and `peer_card` instructions add to the dream instructions without falling back to the shared value. No migration: configuration is JSONB (#1303)
+- Telemetry records custom instructions. `representation.completed`, the summary event, `dialectic.completed`, and `dream.specialist` carry `custom_instructions_tokens` and `custom_instructions_source` (e.g. `session.shared`, `workspace.summary`); `llm.call.traced` links the injected text through `custom_instructions_ref`; Langfuse generations carry it under the `custom_instructions` metadata key. Additive fields, so `_schema_version` is unchanged (#1309)
+- `python -m src.migrate [revision]` runs migrations under a Postgres advisory lock, so replicas that start together no longer race on `alembic upgrade` (`tuple concurrently updated`). A waiter polls for up to `DB_MIGRATION_LOCK_WAIT_SECONDS` (default 300), then fails naming the holder's pid. `scripts/migrate_db.py` and `scripts/provision_db.py` wrap it (#1268)
+- List endpoints take an opt-in `cursor` query parameter: send it empty for the first page, then pass each response's `next_page`. Cursor mode returns a keyset-paginated page with no `COUNT` and one index seek per page, so deep walks stay cheap. Without `cursor` the response is the unchanged `Page`, and a server that predates this ignores the parameter, so clients can detect support from the response shape. A malformed cursor returns a 400 (#1326)
+
+### Changed
+
+- The deriver prompt states the target peer's id as the subject of every conclusion about that peer, instead of "the target peer" or "the user" (#1273)
+- `search_messages` (and the `search_memory` fallback and `search_messages_temporal`) drops whole trailing snippets when its output exceeds the tool budget and appends `[N of M snippets shown - K omitted to fit output budget]`, instead of cutting the text mid-snippet with no notice. Tool-call telemetry reports `was_truncated` and the pre-truncation size (#1265)
+- Reconciler backfills are registered through a generic `Backfill` definition, each scheduled as `reconciler:backfill.<name>` only while it has pending rows. The existing document-sources backfill keeps its queue shape, so pre-3.3 workers sharing the queue still run it during a rolling deploy (#1275)
+- `/openapi.json` no longer hardcodes `https://api.honcho.dev` as its first server. Self-hosted `/docs` "Try it out" and generated clients target the origin they were served from; behind a prefix-stripping proxy, set `--root-path` (#1103)
+- Gemini `gemini-embedding-2` models embed up to 8192 input tokens instead of being capped at 2048. Other Gemini models keep the 2048 cap (#925)
+- `uv.lock` bumps `starlette` (1.0.0 → 1.6.0, CVE-2026-48710), `python-multipart`, `anyio`, and `idna` to patched versions, which the Docker image picks up through `uv sync --frozen` (#1266)
+- Session summaries ask for about 60% of their token cap instead of a hard word limit, leaving headroom so dense content finishes instead of being cut off mid-summary. The default caps rise from 1000/4000 to 1500/6000 (`SUMMARY_MAX_TOKENS_SHORT` / `SUMMARY_MAX_TOKENS_LONG`), so default summaries stay about the same length. When `SUMMARY_MODEL_CONFIG__MAX_OUTPUT_TOKENS` is set it is a ceiling: settings fail to load if either cap exceeds it, so a deployment that sets it below 6000 must lower the caps to match or raise it (#1318)
+- The deriver's semantic deduplication looks up candidates for the whole batch in one query instead of one query per conclusion (#1202)
+- With the cache enabled, offset-paginated list requests (`?page=N`) seek from where the previous page ended instead of scanning past every earlier row, so installed SDKs walking long lists get faster without an upgrade. Responses are unchanged, except that `total` on pages after the first may be up to `CACHE_PAGINATION_COUNT_TTL_SECONDS` (default 60) old. `CACHE_PAGINATION_OFFSET_SHIM` (default `true`) turns it off, `CACHE_PAGINATION_POSITION_TTL_SECONDS` (default 600) sets how long a page position lives, and `pagination_offset_shim{outcome}` counts first, hit, and miss pages. Adds the `sqlakeyset` dependency (#1326)
+- Message search's `content ILIKE` fallback is backed by a new `pg_trgm` GIN index, `ix_messages_content_trgm`, instead of scanning every message in the workspace (scans held connections for 10s+ on large deployments). This release includes a migration. The index is roughly 1.5× the size of `messages`, so plan disk headroom before upgrading. It is built `CONCURRENTLY`, so writes continue, but the build waits for open transactions that touched `messages` and for any older snapshot in the database, such as a long-running query on any table. After 60 minutes the migration fails and leaves an invalid index, which the next run drops and rebuilds; on large or busy databases, build the index ahead of the upgrade with the statement in the troubleshooting guide, and the migration then has nothing to do. If `pg_trgm` can't be created (no privilege, or not available on the server), the migration skips the index and logs the statement to create it later (#1335)
+
+### Removed
+
+- `DIALECTIC_HISTORY_TOKEN_LIMIT` and `DREAM_HISTORY_TOKEN_LIMIT`, along with the unused `get_recent_history` agent tool they fed. A leftover value is ignored (#1308)
+
+### Fixed
+
+- Cloning a session matched the source's messages, peers, and cutoff message by session name alone, so it could copy a same-named session's data from another workspace or fail with a 500. Lookups are scoped to the workspace. Cloned messages also keep `token_count`, and cloning a session with no messages copies its peers and commits instead of returning a 201 for a session that was rolled back (#1284)
+- JWTs with an expiry (`--expires` on `scripts/generate_jwt.py`, `expires_at` on `POST /v3/keys`) failed every request with a 401, because `exp` was written as an ISO string instead of a NumericDate. Expiring keys now authenticate until they expire, and an expired key returns `JWT expired` (#1025)
+- OpenAI `gpt-6` models failed with a 400 `unsupported_parameter` because Honcho sent `max_tokens`; they now get `max_completion_tokens` like `gpt-5` and the o-series (#1233)
+- A summary that hits its cap while repeating itself (fewer than 35% distinct 4-word sequences) is discarded and the previous summary kept, instead of overwriting it. Rejections are counted in `summary_rejections{summary_type,reason}` (#1318)
+- Session peer and webhook list endpoints had no `ORDER BY`, so their pages could skip or repeat rows. They order by `(joined_at, id)` and `(created_at, id)` (#1326)
+- A connection dropped by the pooler during the representation's semantic conclusion lookup no longer fails the request with `PendingRollbackError`. On read-only sessions the connection is rolled back and the lookup degrades to no semantic conclusions (#1335)
+
+## [3.2.2] - 2026-09-29
+
+### Added
+
+- `CACHE_CONNECT_TIMEOUT_SECONDS` (default 5) and `CACHE_CONNECT_RETRIES` (default 3). The Redis client retries a failed connect with exponential backoff (0.1s base, 0.5s cap), so an instance that boots alongside several others no longer fails on a single `Timeout connecting to server` (#1234)
+
+### Changed
+
+- Listing a peer's sessions uses a new `session_peers (workspace_name, peer_name, session_name)` index and starts from that peer's rows instead of walking every session in the workspace (28.9ms to 0.15ms on a 326k-row test table). This release includes a migration. The index is not built `CONCURRENTLY`, so writes to `session_peers` wait while it builds (#1237)
+- LLM provider 5xx and connection errors are no longer sent to Sentry on every attempt by the Anthropic, OpenAI, and Google GenAI SDK integrations. Honcho reports the final error once its retries are exhausted, so an outage that recovers on retry no longer alerts. Client errors (400, 401, 404, 429) are still reported (#1242)
+- Dialectic and dreamer runs are typed `agent` in Langfuse, so they appear in the Agent Graph. Generation output with tool calls is an OpenAI-style assistant message carrying the tool arguments and any thinking, instead of just the tool names. The `langfuse` floor rises to `>=4.6.1` (#1258)
+- The deriver prompt and output schema no longer carry example facts. New rules resolve relative dates against each message's `time`, treat details in a question or proposal the target peer accepts as stated by them, skip conversational mechanics (greetings, thanks, acknowledgements), and keep one fact per conclusion with its qualifiers attached and no reworded duplicates (#1263)
+
+### Removed
+
+- Inline Langfuse instrumentation and the `LANGFUSE_EXPORTER_MODE` setting. Langfuse traces now come only from the exporter over the captured LLM call stream, which has been the default since 3.0.12. A leftover `LANGFUSE_EXPORTER_MODE=inline` is ignored. The exporter only registers when `TELEMETRY_ENABLED` is true, so deployments that set Langfuse keys with telemetry off no longer get traces (#1253)
+
+### Fixed
+
+- Context routes (`GET /peers/{id}/context`, `POST /peers/{id}/representation`, `GET /sessions/{id}/context`) truncate a `search_query` longer than `EMBEDDING.MAX_INPUT_TOKENS` (8192) before embedding it. Before, the embed failed and the route returned a 200 with semantic results silently dropped. Session context also releases its DB connection before the embedding call (#1255)
+- Langfuse traces reflect what happened: generations show the call's real latency, every trace has one root observation, `user_id` and the trace name sit on every observation, run and step spans stay open until the run ends, and tool spans carry the result and real duration (#1235)
+- A Redis connection dropped while idle is reconnected and the command retried, instead of failing the request. uvloop raised a `RuntimeError` on the closed transport, which redis-py did not treat as a connection error (#1245)
+
+## [3.2.1] - 2026-09-22
+
+### Added
+
+- Chat evidence conclusions carry `observer_id` and `observed_id`, matching the Conclusions response. Workspace chat reads across every peer into one evidence list, so each row now says which pair it belongs to without re-fetching it (#1193)
+- `thinking_tool_choice_conflict` provider param for Anthropic model configs, which decides what happens when extended thinking meets a forced tool choice (Anthropic rejects the combination): `throw` (default, raises a validation error before the request is sent), `override_thinking` (drops thinking for that call), or `override_tool` (relaxes the tool choice to `auto`). Set it per model config, e.g. `DIALECTIC_LEVELS__medium__MODEL_CONFIG__OVERRIDES__PROVIDER_PARAMS__THINKING_TOOL_CHOICE_CONFLICT=override_thinking` (#1211)
+
+### Changed
+
+- `source_ids` is `[]` rather than `null` for explicit conclusions on the Conclusions response, matching chat evidence. Clients that checked for `null` should check for an empty list (#1193)
+- Workspace chat keeps its forced tool choice until a recall tool runs cleanly, capped at 3 forced rounds, so an answer always rests on at least one search instead of the prefetched overview. A tool that returns an error does not count. `get_workspace_stats` is removed from the workspace toolset, since the prefetch already supplies the same overview (#1210)
+- The deriver wraps each batch message in a tag carrying its peer and whether it is a target, and derives only from target messages, instead of relying on the model to match a name prefix. Message content that imitates the tag is escaped so it cannot claim target attribution (#1192)
+- Smaller runtime footprint: the Docker image drops from 627MB to 426MB. PDF extraction uses pypdf instead of pdfplumber, provider SDKs import only for the configured backend, and scikit-learn moves behind a new optional `surprisal` extra. Self-hosted deployments that enable `DREAM.SURPRISAL.ENABLED` with an sklearn-backed tree type need the extra; `rptree`, `covertree`, and `lsh` still work without it (#1201)
+
+### Fixed
+
+- Chat with `include_evidence` no longer fails with "Instance is not bound to a Session" when evidence is read after its DB session closes (#1212)
+- On Redis Cluster, each process releases the idle connection its startup PING leaves on the default node. Every client picks the same slot-0 primary, so these sockets piled up there (92% of that node's connections in one observed cluster) and could hit `maxclients`, which stops every new client from initialising (#1198)
+- Dreamer tools return an actionable error for malformed arguments (a string instead of a list, non-object items) instead of raising a `TypeError` mid-loop. Valid sibling observations in the same call still land (#1217)
+- Deleting a session no longer loads the content of every embedding chunk to rebuild vector IDs; chunk counts are aggregated in SQL (#1206)
+
+## [3.2.0] - 2026-09-15
+
+### Added
+
+- Conclusion attribution on the public API: `source_ids` and `times_derived` on the Conclusions response (already stored on documents, previously stripped). `GET /v3/workspaces/{workspace_id}/conclusions/{conclusion_id}` returns a single conclusion with those fields. `source_ids` is filterable via JSONB containment (`{"source_ids": {"contains": "<id>"}}`); `id`, `level`, `source_ids`, and `times_derived` are explicit entries in the documents filter allowlist. The same `contains` fix applies to other JSONB columns, which previously generated invalid ILIKE-on-JSONB SQL. Message attribution (conclusion → source messages) and chain traversal are follow-ups (#952)
+- Opt-in `include_evidence` on pair and workspace chat (`POST /peers/{id}/chat` and `POST /workspaces/{id}/chat`). When true, the response carries the conclusions and messages the agent read plus the tools it called, so a caller can inspect what an answer was built from. Evidence is collated from what the agent accessed, never reported by the model — it over-reports (a conclusion appears because it was seen, not because the answer used it) but is deterministic and costs no model tokens. Off by default so existing callers are unchanged. Streaming puts evidence on the terminal SSE event only (#1129)
+
+### Changed
+
+- CloudEvents LLM and embedding traces (schema version 2) now carry session, workspace, observers, observed, agent type, track name, source message ids, queue item ids, duration, outcome, retry, and a full `system_prompt_ref`. Streamed calls record once at the provider boundary, including interrupted streams. New fields are nullable so v1 archives still load (#1166)
+- Request middleware falls back to `User-Agent` as the CloudEvents `client.host` when `X-Honcho-Host` is absent, so raw REST clients are distinguishable from SDKs without waiting for SDK upgrades. An explicit `X-Honcho-Host` still wins (#1182)
+
+### Fixed
+
+- Dreamer-written conclusions no longer persist fabricated `source_ids`. Unresolvable ids are stripped at the write path; an observation left below its level's minimum real sources is rejected (#945)
+- LLM provider outages (connection failures and upstream 5xx) now surface as 503 instead of an opaque 500. Exhausted retries re-raise the provider error instead of a tenacity `RetryError`. 4xx including 429 is unchanged. The streaming path is not covered (#1165)
+- Peer-scoped keys on `POST /sessions` and `POST /peers` may only name their own peer, must already be a member to get an existing session, and may not send metadata or configuration for one. Creating a fresh session for itself is unchanged. Session-scoped keys are denied on `POST /peers` (#1172)
+- `get_working_representation` reclaims unused query budget when semantic or most-derived search returns fewer unique documents than requested, filling the remainder from recent observations while preserving search priority (#1008)
+- Redis Cluster async client no longer leaks connections on topology re-init. The pin is now `redis>=8.0.1,<9.0.0` (was `<8.0.0`, which excluded the upstream fix in redis-py 8.0.0) (#1157)
+
+## [3.1.2] - 2026-09-09
+
+### Added
+
+- Qdrant vector store backend (`VECTOR_STORE_TYPE=qdrant`) as an optional `qdrant` extra. Point at a server with `VECTOR_STORE_QDRANT_URL` (optional API key, gRPC, HTTPS, prefix, timeout). Same `VECTOR_STORE_MIGRATED` cutover path as the other backends (#683)
+- MCP stdio host (`bun --cwd mcp src/stdio.ts`) for local clients, plus a Streamable HTTP host (`bun src/http.ts` / `mcp/Dockerfile`) with an `mcp` compose service. HTTP requires Bearer on every request including established sessions; idle sessions expire after `MCP_SESSION_IDLE_MS` (default 30m) and are capped at `MCP_SESSION_MAX` (default 128). Sessions are in-process — run one replica (#1102)
+- MCP tools take `scope` (name or list) and `sessions` (session-id allowlist) on `chat`, `page`/`size`/`reverse` on `list_sessions` and `get_session_messages`, plus `list_scopes`, `get_scope_sessions`, and `workspace_chat` (#1139)
+- Deterministic OpenAI-compatible mock provider (`src/mock_provider`) so the stack can run with no model key and no spend. Same image, different entrypoint; chat answers from the request's JSON Schema and embeddings are hash-derived (lexical search only — no semantic recall) (#1094)
+- Ephemeral sandbox (`sandbox/sandbox.sh`): seed snapshots a Postgres template database, reset drops and recreates it (plus Redis flush) without restarting services. Default provider is mock; `--provider real` reads gitignored credentials. Reset refuses a stale snapshot (Alembic revision / fixture hash / provider mode) (#1111)
+- `DERIVER.SCHEDULER=api` (env `DERIVER__SCHEDULER`) moves deriver/dream timers onto the API process so deriver replicas only consume work. Default remains `deriver`. When the API owns scheduling, deriver startup poll jitter is skipped (#1136, #1149)
+- Deriver backlog as Prometheus gauges on the API (`deriver_outstanding_work_seconds`, `deriver_queue_work_units_eligible` / `_claimed`, `deriver_queue_items_pending`, `deriver_queue_oldest_pending_age_seconds`, `dreams_due`, `deriver_metrics_last_success_timestamp_seconds`) and as JSON at `GET /deriver/metrics`. Service-wide DB values — aggregate with `max()`/`avg()`, never `sum()` (#1115)
+- Docker API worker count via `API_WORKERS` (default 1) on the image entrypoint (#1088)
+- Client identity on CloudEvents: request middleware reads `X-Honcho-Host`, `X-Honcho-Plugin`, and `X-Honcho-Agent-Model` into a nested `client` object next to `honcho_version`. Null outside a request (deriver worker). Emitter-injected fields are exempt from per-event schema versioning (#1125)
+
+### Fixed
+
+- Workspace chat requires a tool call on the first turn instead of answering from the prefetch overview alone. `low` was the only level that left tool choice as `auto`, and those calls were skipping search. Pair chat is unchanged. The workspace prompt is also marked non-interactive so it stops offering the caller a menu (#1120)
+
+## [3.1.1] - 2026-09-02
+
+### Changed
+
+- Server `requires-python` is `>=3.13`, matching the production image. Self-hosters on 3.10–3.12 need to upgrade; SDK and CLI floors are unchanged (#1090)
+
+### Fixed
+
+- Concurrent `create_documents` writers to the same collection deadlocked on `times_derived` reinforcement UPDATEs issued in batch order; the error was swallowed per-document, the batch was lost, and the queue item was marked processed. Writers now lock target rows with `SELECT ... ORDER BY id FOR UPDATE` before applying, abort the batch on `SQLAlchemyError` instead of continuing through a dead session, and retry transient errors (deadlock, serialization failure, lock/statement timeout, lost connection) up to `MAX_RETRYABLE_ATTEMPTS` instead of burning the item (#1033)
+- Scope backfill no longer embeds, writes, and syncs every planned copy at once. A 14k-document session is ~580MB of vectors; several concurrent backfills OOM-killed the deriver at its 1000Mi limit and crash-looped because the work units never completed. Phases 2–4 now run per chunk of 500 specs, reload source embeddings per chunk, and drop them once synced. Membership is locked across chunk writes so a concurrent leave cannot commit between the check and the inserts (#1104)
+- Model-generated observations with NUL bytes (`\u0000`) no longer fail the exact-content dedup pre-fetch with a Postgres `DataError` that dropped the whole observer batch. Ingress already stripped NUL from user content; the deriver now strips it so stored text matches embedded text. All-NUL content is dropped rather than stored empty (#1095)
+- `search_messages` no longer forwards `top_k=0` to Turbopuffer (which requires 1..10000). Zero/negative limits short-circuit to empty results; tool limits are floored at 1. The documents path was already guarded (#970); this closes the message path (#1084)
+- OpenAI-compatible tool-call turns with `content=null` keep null through history replay instead of being coerced to `""`. Providers that bind reasoning state to the exact assistant message shape were breaking on the empty string. Tool-less null still becomes `""` (#1064)
+- The production image now ships `pyproject.toml` in the runtime stage, so the service reports its real version instead of `unknown` in OpenAPI and telemetry (#1074)
+
 ## [3.1.0] - 2026-08-25
 
 ### Added

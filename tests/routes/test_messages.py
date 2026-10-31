@@ -1150,6 +1150,51 @@ async def test_create_messages_with_file_too_large(
 
 
 @pytest.mark.asyncio
+async def test_upload_malformed_pdf_returns_422(
+    client: TestClient, db_session: AsyncSession, sample_data: tuple[Workspace, Peer]
+):
+    """A truncated or garbage PDF is a bad upload (422), not a server error."""
+    test_workspace, test_peer = sample_data
+    test_session = models.Session(
+        workspace_name=test_workspace.name, name=str(generate_nanoid())
+    )
+    db_session.add(test_session)
+    await db_session.commit()
+
+    for payload in (b"", b"not a pdf", b"%PDF-1.4\n"):
+        response = client.post(
+            f"/v3/workspaces/{test_workspace.name}/sessions/{test_session.name}/messages/upload",
+            files={"file": ("a.pdf", payload, "application/pdf")},
+            data={"peer_id": test_peer.name},
+        )
+        assert response.status_code == 422, payload
+
+
+@pytest.mark.asyncio
+async def test_upload_form_field_failing_schema_returns_422(
+    client: TestClient, db_session: AsyncSession, sample_data: tuple[Workspace, Peer]
+):
+    """Form fields are JSON-decoded before validation, so a well-formed value of
+    the wrong type (a list for metadata) must still be a 422."""
+    test_workspace, test_peer = sample_data
+    test_session = models.Session(
+        workspace_name=test_workspace.name, name=str(generate_nanoid())
+    )
+    db_session.add(test_session)
+    await db_session.commit()
+
+    response = client.post(
+        f"/v3/workspaces/{test_workspace.name}/sessions/{test_session.name}/messages/upload",
+        files={"file": ("a.txt", b"hello", "text/plain")},
+        data={"peer_id": test_peer.name, "metadata": "[]"},
+    )
+    assert response.status_code == 422, response.text
+    error = response.json()["detail"][0]
+    assert error["loc"] == ["body", "metadata"]
+    assert "input" not in error
+
+
+@pytest.mark.asyncio
 async def test_create_message_with_timestamp(
     client: TestClient, db_session: AsyncSession, sample_data: tuple[Workspace, Peer]
 ):
@@ -1164,9 +1209,7 @@ async def test_create_message_with_timestamp(
     await db_session.commit()
 
     # Use a specific timestamp for testing
-    custom_timestamp = datetime.datetime(
-        2023, 1, 1, 12, 0, 0, tzinfo=datetime.timezone.utc
-    )
+    custom_timestamp = datetime.datetime(2023, 1, 1, 12, 0, 0, tzinfo=datetime.UTC)
 
     response = client.post(
         f"/v3/workspaces/{test_workspace.name}/sessions/{test_session.name}/messages",
@@ -1210,9 +1253,7 @@ async def test_create_message_without_timestamp_uses_default(
     await db_session.commit()
 
     # Pad the window to absorb client/Postgres clock skew under Docker.
-    before_request = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(
-        seconds=1
-    )
+    before_request = datetime.datetime.now(datetime.UTC) - datetime.timedelta(seconds=1)
 
     response = client.post(
         f"/v3/workspaces/{test_workspace.name}/sessions/{test_session.name}/messages",
@@ -1227,9 +1268,7 @@ async def test_create_message_without_timestamp_uses_default(
         },
     )
 
-    after_request = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(
-        seconds=1
-    )
+    after_request = datetime.datetime.now(datetime.UTC) + datetime.timedelta(seconds=1)
 
     assert response.status_code == 201
     data = response.json()
@@ -1261,12 +1300,10 @@ async def test_create_batch_messages_with_mixed_timestamps(
     await db_session.commit()
 
     # Use specific timestamps for testing
-    timestamp1 = datetime.datetime(2023, 1, 1, 12, 0, 0, tzinfo=datetime.timezone.utc)
-    timestamp2 = datetime.datetime(2023, 1, 2, 12, 0, 0, tzinfo=datetime.timezone.utc)
+    timestamp1 = datetime.datetime(2023, 1, 1, 12, 0, 0, tzinfo=datetime.UTC)
+    timestamp2 = datetime.datetime(2023, 1, 2, 12, 0, 0, tzinfo=datetime.UTC)
 
-    before_request = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(
-        seconds=1
-    )
+    before_request = datetime.datetime.now(datetime.UTC) - datetime.timedelta(seconds=1)
 
     response = client.post(
         f"/v3/workspaces/{test_workspace.name}/sessions/{test_session.name}/messages",
@@ -1293,9 +1330,7 @@ async def test_create_batch_messages_with_mixed_timestamps(
         },
     )
 
-    after_request = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(
-        seconds=1
-    )
+    after_request = datetime.datetime.now(datetime.UTC) + datetime.timedelta(seconds=1)
 
     assert response.status_code == 201
     data = response.json()
@@ -1338,9 +1373,7 @@ async def test_create_message_with_null_timestamp(
     db_session.add(test_session)
     await db_session.commit()
 
-    before_request = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(
-        seconds=1
-    )
+    before_request = datetime.datetime.now(datetime.UTC) - datetime.timedelta(seconds=1)
 
     response = client.post(
         f"/v3/workspaces/{test_workspace.name}/sessions/{test_session.name}/messages",
@@ -1356,9 +1389,7 @@ async def test_create_message_with_null_timestamp(
         },
     )
 
-    after_request = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(
-        seconds=1
-    )
+    after_request = datetime.datetime.now(datetime.UTC) + datetime.timedelta(seconds=1)
 
     assert response.status_code == 201
     data = response.json()
