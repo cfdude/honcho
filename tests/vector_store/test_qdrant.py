@@ -6,11 +6,14 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from qdrant_client import models
 
 from src.exceptions import VectorStoreError
 from src.vector_store import VectorRecord
-from src.vector_store.qdrant import (
+
+pytest.importorskip("qdrant_client")
+from qdrant_client import models  # noqa: E402
+
+from src.vector_store.qdrant import (  # noqa: E402
     QdrantVectorStore,
     _point_id,  # pyright: ignore[reportPrivateUsage]
 )

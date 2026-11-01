@@ -7,7 +7,8 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from src.vector_store.lancedb import LanceDBVectorStore
+pytest.importorskip("lancedb")
+from src.vector_store.lancedb import LanceDBVectorStore  # noqa: E402
 
 
 def _build_query_chain(rows: list[dict[str, Any]]) -> MagicMock:
