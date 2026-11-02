@@ -53,6 +53,7 @@ jobs:
     # Manual triggers (label / workflow_dispatch) additionally require the
     # gate's CODEOWNERS check to have passed.
     if: >-
+      github.repository == 'plastic-labs/honcho' &&
       always() &&
       (github.event_name == 'push' ||
        ((github.event_name == 'workflow_dispatch' ||

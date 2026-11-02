@@ -46,6 +46,7 @@ jobs:
     # every job here; the run-unified-tests label additionally requires the
     # gate's CODEOWNERS check to have passed.
     if: >-
+      github.repository == 'plastic-labs/honcho' &&
       always() &&
       (github.event_name == 'push' ||
        (github.event.label.name == 'run-unified-tests' &&
