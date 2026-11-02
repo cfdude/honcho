@@ -1,10 +1,16 @@
 # https://pythonspeed.com/articles/base-image-python-docker-images/
 # https://testdriven.io/blog/docker-best-practices/
-FROM python:3.13-slim-bookworm
+#
+# MULTI-STAGE, and deliberately WITHOUT BuildKit.
+# Upstream's Dockerfile uses `--mount=type=cache` and a `# syntax=` directive, both of
+# which need BuildKit. Railway's Railpack builder rejects type=bind and unscoped
+# type=cache mounts, so this fork keeps plain RUN layers and must stay buildable with
+# DOCKER_BUILDKIT=0. The multi-stage split is what shrinks the image; the cache mount
+# only ever made rebuilds faster.
+FROM python:3.13-slim-bookworm AS builder
 
 COPY --from=ghcr.io/astral-sh/uv:0.13.5 /uv /bin/uv
 
-# Set Working directory
 WORKDIR /app
 
 # Enable bytecode compilation
@@ -17,23 +23,44 @@ ENV UV_LINK_MODE=copy
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 
-# Copy the lockfile + project metadata first (no BuildKit --mount: Railway's
-# Railpack builder rejects both type=bind and unscoped type=cache mounts)
+# No BuildKit cache mount is available, so uv's cache would otherwise land in the
+# image layer it is written in. Point it at /tmp and delete it in the same RUN.
+ENV UV_CACHE_DIR=/tmp/uv-cache
+
+# Copy the lockfile + project metadata first so dependency resolution caches as a layer
 COPY uv.lock pyproject.toml /app/
 
-# Install the project's dependencies using the lockfile and settings
-RUN uv sync --frozen --no-install-project --no-group dev
+# Dependencies only. The project itself is installed in the second sync below, after
+# its source is present -- installing it before the source exists produces a venv entry
+# that points at an empty tree.
+RUN uv sync --frozen --no-install-project --no-group dev && rm -rf /tmp/uv-cache
 
-# Sync the project
-RUN uv sync --frozen --no-group dev
+# The project's own source, needed for the second sync
+COPY src/ /app/src/
+COPY migrations/ /app/migrations/
+COPY alembic.ini /app/alembic.ini
+
+RUN uv sync --frozen --no-group dev && rm -rf /tmp/uv-cache
+
+FROM python:3.13-slim-bookworm AS runtime
+
+WORKDIR /app
+
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+
+# Create the runtime user BEFORE copying the virtualenv, so --chown lands it with its
+# final owner. A recursive chown in a later layer would copy the whole venv and nearly
+# double the image size -- the exact trap this change exists to avoid.
+RUN addgroup --system app \
+    && adduser --system --group app \
+    && chown app:app /app
+
+COPY --from=builder --chown=app:app /app/.venv /app/.venv
 
 # Place executables in the environment at the front of the path
 ENV PATH="/app/.venv/bin:$PATH"
 ENV HOME=/app
-ENV UV_CACHE_DIR=/tmp/uv-cache
-
-# Create non-root user and set ownership
-RUN addgroup --system app && adduser --system --group app && mkdir -p /tmp/uv-cache && chown -R app:app /app /tmp/uv-cache
 
 COPY --chown=app:app src/ /app/src/
 COPY --chown=app:app migrations/ /app/migrations/
@@ -51,4 +78,7 @@ USER app
 
 EXPOSE 8000
 
+# NOT upstream's `fastapi run`. docker/entrypoint.sh branches on HONCHO_ROLE to start
+# either the API (which runs the migrations first) or the deriver, which is how one
+# image serves both Railway services.
 CMD ["sh", "docker/entrypoint.sh"]
