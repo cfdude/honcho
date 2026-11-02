@@ -55,6 +55,8 @@ permissions:
 
 jobs:
   plan:
+    # Fork gate: needs upstream-only infra (Fly runner / AWS OIDC / ghcr release images).
+    if: github.repository == 'plastic-labs/honcho'
     runs-on: ubuntu-latest
     outputs:
       old_image: ${{ steps.old.outputs.image }}
