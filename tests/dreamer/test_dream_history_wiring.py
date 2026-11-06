@@ -31,6 +31,32 @@ def _no_metrics(  # pyright: ignore[reportUnusedFunction]
     monkeypatch.setattr(settings.METRICS, "ENABLED", False)
 
 
+@pytest.fixture(autouse=True)
+def _dreams_enabled(  # pyright: ignore[reportUnusedFunction]
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Force DREAM.ENABLED on so this file works regardless of local config.
+
+    `orchestrator.run_dream` returns None immediately on
+    `not settings.DREAM.ENABLED` (src/dreamer/orchestrator.py:156-157), before
+    it opens a history run or calls a specialist. Three tests here assert on
+    what run_dream did, so an operator `.env` carrying DREAM_ENABLED=false
+    turns them into false failures: the run record is never created and the
+    specialist stub records nothing.
+
+    Note `src/config.py` calls `load_dotenv(override=True)`, so a `.env` beats
+    a real environment variable -- `DREAM_ENABLED=true` on the command line
+    does NOT fix the run. Pinning the setting in-process is the only reliable
+    fix, and it is the convention this suite already uses in
+    tests/dreamer/test_dream_scheduler.py and tests/routes/test_workspaces.py.
+
+    Same bug class, same fix as tests/routes/test_scope_route_policy.py, which
+    this fork already pinned for `schedule_dream` (upstream-pr branch
+    dream-enabled-scope-tests).
+    """
+    monkeypatch.setattr(settings.DREAM, "ENABLED", True)
+
+
 async def test_dream_tool_writes_record_to_the_run(
     db_session: AsyncSession, sample_data: tuple[Workspace, Peer]
 ):

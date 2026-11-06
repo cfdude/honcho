@@ -20,8 +20,15 @@ def dependency_install() -> tuple[dict[str, str], str]:
     dockerfile = DOCKERFILE.read_text()
     defaults = dict(re.findall(r"^ARG (INSTALL_\w+)=(.*)$", dockerfile, re.MULTILINE))
     assert defaults == {"INSTALL_LANCEDB": "false", "INSTALL_SURPRISAL": "false"}
+    # FORK CHANGE (cfdude/honcho): upstream anchors this on the BuildKit cache mount,
+    # `RUN --mount=type=cache,target=/root/.cache/uv`. This fork's Dockerfile cannot
+    # carry that line -- Railway's Railpack builder rejects unscoped type=cache mounts,
+    # so the image is built with DOCKER_BUILDKIT=0 and plain RUN layers. The mount
+    # prefix is therefore OPTIONAL here. Everything the test actually exercises -- the
+    # two ARG defaults, the `case` validation and the composed `uv sync` arguments --
+    # is unchanged, and the assertion on `defaults` above still pins both ARGs.
     run_instruction = re.search(
-        r"^RUN --mount=type=cache,target=/root/\.cache/uv \\\n((?:.*\\\n)*.*)",
+        r"^RUN (?:--mount=type=cache,target=/root/\.cache/uv \\\n)?((?:.*\\\n)*.*)",
         dockerfile,
         re.MULTILINE,
     )
