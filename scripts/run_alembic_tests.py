@@ -57,8 +57,13 @@ def main():
 
     changed_files = [Path(f) for f in sys.argv[1:]]
 
-    # Paths
-    repo_root = Path(__file__).parent.parent
+    # Paths. `.resolve()` is load-bearing: the changed files below are resolved to
+    # absolute paths, and .pre-commit-config.yaml invokes this script by a RELATIVE path
+    # ("uv run --frozen python scripts/run_alembic_tests.py"), which makes __file__
+    # relative and repo_root ".". Every `filepath.parent == migrations_dir` comparison
+    # then fails, no revision is ever collected, and the hook prints "No alembic tests to
+    # run" and exits 0 -- so the pre-push migration gate passes without running anything.
+    repo_root = Path(__file__).resolve().parent.parent
     migrations_dir = repo_root / "migrations" / "versions"
     tests_dir = repo_root / "tests" / "alembic" / "revisions"
     alembic_tests_dir = repo_root / "tests" / "alembic"
@@ -106,6 +111,14 @@ def main():
         cmd = [
             "uv",
             "run",
+            # --frozen, like every other hook in this repo's .pre-commit-config.yaml. A
+            # non-frozen `uv run` re-resolves and REWRITES uv.lock whenever the local uv
+            # cannot parse pyproject's [tool.uv] settings -- `exclude-newer = "5 days"`
+            # needs a recent uv -- and an older one prints "Ignoring existing lockfile due
+            # to removal of timestamp cutoff" and swaps the venv underneath whatever else
+            # is running. Measured in this repo: 120 packages uninstalled and 126
+            # installed mid-test-run, plus a modified uv.lock.
+            "--frozen",
             "pytest",
             "tests/alembic/test_pipeline.py",
             "-n0",
@@ -124,6 +137,7 @@ def main():
         cmd = [
             "uv",
             "run",
+            "--frozen",  # see the note on the full-suite invocation above
             "pytest",
             "tests/alembic/test_pipeline.py",
             "-n0",
