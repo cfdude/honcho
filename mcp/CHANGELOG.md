@@ -9,6 +9,17 @@ This package versions independently of the Honcho API, `@honcho-ai/sdk`, and hos
 
 ## [Unreleased]
 
+## [3.3.0] - 2026-10-29
+
+### Added
+
+- `source_message_ids` on every conclusion the tools return: the messages an
+  explicit conclusion cites as evidence (Honcho v3.5.0+, null for derived levels
+  and on older servers). `list_conclusions` filters accept
+  `{"source_message_ids": {"contains": "<message id>"}}` to find the
+  conclusions that cite a message as evidence. Surfaces once `@honcho-ai/sdk`
+  carries the field; earlier SDKs report null
+
 ### Security
 
 - The Docker image now builds on Bun 1.4.4 (was 1.2), the first Bun that
@@ -20,7 +31,6 @@ This package versions independently of the Honcho API, `@honcho-ai/sdk`, and hos
 
 ### Added
 
-- `source_message_ids` on every conclusion the tools return: the messages an explicit conclusion cites as evidence (Honcho v3.4.0+, null for derived levels and on older servers). `list_conclusions` filters accept `{"source_message_ids": {"contains": "<message id>"}}` to find the conclusions that cite a message as evidence. Surfaces once `@honcho-ai/sdk` carries the field; earlier SDKs report null
 - A caller-set `X-Honcho-Plugin` header is forwarded to the Honcho API as the
   plugin identity, with the host appended in parentheses
   (`cursor-honcho/0.2.0 (Cursor/1.0.0)`). Integrations that configure a

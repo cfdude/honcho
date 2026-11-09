@@ -29,7 +29,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from nanoid import generate as generate_nanoid
-from sqlalchemy import delete, exists, insert, or_, select, update
+from sqlalchemy import delete, insert, or_, select, update
 from sqlalchemy.dialects.postgresql import array
 from sqlalchemy.orm import load_only
 from sqlalchemy.sql.functions import func
@@ -199,6 +199,7 @@ async def _run_backfill(
                 )
             )
             .where(
+                models.Document.tenant_id == models.scoped_tenant_id(),
                 models.Document.workspace_name == workspace_name,
                 models.Document.session_name == session_name,
                 models.Document.level == "explicit",
@@ -347,6 +348,7 @@ async def _copy_chunk(
         # (``left_at``) cannot commit between the check and the inserts.
         membership = await db.scalar(
             select(models.SessionPeer.peer_name)
+            .where(models.SessionPeer.tenant_id == models.scoped_tenant_id())
             .where(models.SessionPeer.workspace_name == workspace_name)
             .where(models.SessionPeer.session_name == session_name)
             .where(models.SessionPeer.peer_name == scope_peer)
@@ -416,6 +418,7 @@ async def _copy_chunk(
                 await db.execute(
                     insert(models.ConclusionSourceMessage), restored_citations
                 )
+        await crud.record_explicit_documents(db, new_rows)
         await db.commit()
 
         # IDs are generated client-side and remain accessible post-commit
@@ -464,7 +467,7 @@ async def _sync_copies_to_vector_store(
     synced_ids: list[str] = []
     failed_ids: list[str] = []
     for observed, specs in by_observed.items():
-        namespace = external_vector_store.get_vector_namespace(
+        namespace = await external_vector_store.get_vector_namespace(
             "document", workspace_name, scope_peer, observed
         )
         records = [
@@ -525,17 +528,43 @@ async def process_scope_removal(
     Soft-deletes (fail-closed) rather than hard-deletes: the reconciler's
     soft-delete sweep handles vector cleanup and eventual hard deletion, and a
     later re-add restores the same rows.
+
+    Skipped entirely if the session is an active member again: it was re-added
+    after this task was queued, and its copies, notes and status are live data
+    the re-add's backfill reconciles.
     """
     scope_peer = payload.scope_peer
     session_name = payload.session_name
 
     removed_by_observed: dict[str, list[str]] = {}
     async with tracked_db("scope_removal") as db:
+        # Row-lock the membership for this whole transaction, as the backfill's
+        # write phase does, so a re-add can't commit between this check and the
+        # writes below. Nothing here commits until the end, so the lock holds.
+        rejoined = await db.scalar(
+            select(models.SessionPeer.left_at.is_(None))
+            .where(models.SessionPeer.tenant_id == models.scoped_tenant_id())
+            .where(models.SessionPeer.workspace_name == workspace_name)
+            .where(models.SessionPeer.session_name == session_name)
+            .where(models.SessionPeer.peer_name == scope_peer)
+            .with_for_update()
+        )
+        if rejoined:
+            logger.info(
+                "Scope removal skipped for %s/%s/%s: the session is a member again",
+                workspace_name,
+                scope_peer,
+                session_name,
+            )
+            return
+
         observed_result = await db.execute(
-            select(models.Collection.observed).where(
+            select(models.Collection.observed)
+            .where(
                 models.Collection.workspace_name == workspace_name,
                 models.Collection.observer == scope_peer,
             )
+            .order_by(models.Collection.observed)
         )
         observed_in_scope = [row[0] for row in observed_result.all()]
         for observed in observed_in_scope:
@@ -569,11 +598,17 @@ async def process_scope_removal(
                         models.Document.level != "explicit",
                         models.Document.deleted_at.is_(None),
                         or_(
-                            exists().where(
+                            # An entity column, not a bare exists(): then the
+                            # tenant predicate hook adds tenant_id to it.
+                            select(models.DocumentSource.derived_id)
+                            .where(
+                                models.DocumentSource.tenant_id
+                                == models.Document.tenant_id,
                                 models.DocumentSource.derived_id == models.Document.id,
                                 models.DocumentSource.source_id.in_(frontier),
                                 models.DocumentSource.workspace_name == workspace_name,
-                            ),
+                            )
+                            .exists(),
                             # Undrained rows still link through the legacy column.
                             models.Document.legacy_source_ids.has_any(array(frontier)),
                         ),
@@ -620,7 +655,7 @@ async def process_scope_removal(
     external_vector_store = get_external_vector_store()
     if external_vector_store is not None:
         for observed, removed_ids in removed_by_observed.items():
-            namespace = external_vector_store.get_vector_namespace(
+            namespace = await external_vector_store.get_vector_namespace(
                 "document", workspace_name, scope_peer, observed
             )
             try:
